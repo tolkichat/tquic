@@ -181,6 +181,15 @@ pub trait CongestionController {
     fn min_pacing_rate(&self) -> Option<u64> {
         None
     }
+
+    /// Update the maximum datagram size.
+    /// Called when PMTU discovery updates the max datagram size.
+    fn set_max_datagram_size(&mut self, size: u64) {}
+
+    /// Set whether the connection is application-limited.
+    /// This is used to inform the delivery rate estimator when the
+    /// application has no data to send.
+    fn set_app_limited(&mut self, _app_limited: bool) {}
 }
 
 impl fmt::Debug for dyn CongestionController {

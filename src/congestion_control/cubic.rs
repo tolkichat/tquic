@@ -543,6 +543,10 @@ impl CongestionController for Cubic {
             None => Some(self.pacing_rate),
         }
     }
+
+    fn set_max_datagram_size(&mut self, size: u64) {
+        self.config.max_datagram_size = size;
+    }
 }
 
 #[cfg(test)]

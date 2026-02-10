@@ -750,7 +750,7 @@ impl Connection {
                 }
 
                 // Process acknowledgement
-                let handshake_status = self.handshake_status();
+                let handshake_status = self.handshake_status(self.paths.get(path_id)?);
                 let path = self.paths.get_mut(path_id)?;
                 let (lost_pkts, lost_bytes) = path.recovery.on_ack_received(
                     &ack_ranges,
@@ -1863,10 +1863,16 @@ impl Connection {
             );
         }
 
-        // TODO: check app limited
-        // if write_status.in_flight == true and check app limited
+        // Clear app-limited state when sending in-flight data
+        if write_status.in_flight {
+            self.paths
+                .get_mut(path_id)?
+                .recovery
+                .congestion
+                .set_app_limited(false);
+        }
 
-        let handshake_status = self.handshake_status();
+        let handshake_status = self.handshake_status(self.paths.get(path_id)?);
         self.paths.get_mut(path_id)?.recovery.on_packet_sent(
             sent_pkt,
             space_id,
@@ -2026,7 +2032,11 @@ impl Connection {
 
         // No frames to be sent
         if st.frames.is_empty() {
-            // TODO: set app-limited
+            self.paths
+                .get_mut(path_id)?
+                .recovery
+                .congestion
+                .set_app_limited(true);
             return Err(Error::Done);
         }
 
@@ -3268,15 +3278,31 @@ impl Connection {
             }
             trace!("{} timer {:?} timeout", self.trace_id, timer);
 
-            let handshake_status = self.handshake_status();
             self.timers.stop(timer);
             match timer {
                 Timer::LossDetection => {
+                    // Compute connection-level handshake status parts before the loop.
+                    let keys = self.tls_session.get_keys(Level::Handshake);
+                    let derived_handshake_keys = keys.seal.is_some() && keys.open.is_some();
+                    let peer_verified_address = self.flags.contains(PeerVerifiedInitialAddress);
+                    let completed = self.is_established();
+                    let is_server = self.is_server;
+
                     for (_, path) in self.paths.iter_mut() {
                         if let Some(timer) = path.recovery.loss_detection_timer() {
                             if timer > now {
                                 continue;
                             }
+                            // Compute path-specific anti-amplification limit status.
+                            let at_amplification_limit =
+                                is_server && !path.verified_peer_address && path.anti_ampl_limit == 0;
+                            let handshake_status = HandshakeStatus {
+                                derived_handshake_keys,
+                                peer_verified_address,
+                                completed,
+                                is_server,
+                                at_amplification_limit,
+                            };
                             let (lost_pkts, lost_bytes) = path.recovery.on_loss_detection_timeout(
                                 path.space_id,
                                 &mut self.spaces,
@@ -3557,21 +3583,35 @@ impl Connection {
         // because their acknowledgments cannot be processed.
         // The sender MUST discard all recovery state associated with those
         // packets and MUST remove them from the count of bytes in flight.
-        let handshake_status = self.handshake_status();
-        if let Ok(path) = self.paths.get_active_mut() {
-            path.recovery
-                .on_pkt_num_space_discarded(sid, &mut self.spaces, handshake_status, now);
+        if let Ok(path) = self.paths.get_active() {
+            let handshake_status = self.handshake_status(path);
+            if let Ok(path) = self.paths.get_active_mut() {
+                path.recovery
+                    .on_pkt_num_space_discarded(sid, &mut self.spaces, handshake_status, now);
+            }
         }
     }
 
-    /// Return the handshake status
-    fn handshake_status(&self) -> HandshakeStatus {
+    /// Return the handshake status for loss recovery.
+    ///
+    /// The `path` parameter is used to determine if the server is at the
+    /// anti-amplification limit for the given path.
+    fn handshake_status(&self, path: &path::Path) -> HandshakeStatus {
         let keys = self.tls_session.get_keys(Level::Handshake);
+
+        // The server is at the anti-amplification limit when it cannot send
+        // any more data until it receives more data from the client.
+        // This happens when the peer address is not yet verified and the
+        // amplification limit has been exhausted.
+        let at_amplification_limit =
+            self.is_server && !path.verified_peer_address && path.anti_ampl_limit == 0;
 
         HandshakeStatus {
             derived_handshake_keys: keys.seal.is_some() && keys.open.is_some(),
             peer_verified_address: self.flags.contains(PeerVerifiedInitialAddress),
             completed: self.is_established(),
+            is_server: self.is_server,
+            at_amplification_limit,
         }
     }
 
@@ -3830,10 +3870,79 @@ impl Connection {
     }
 
     /// Migrates the connection to the specified path.
+    ///
+    /// This function switches the active path for the connection to the specified
+    /// path identified by local and remote addresses. The target path must already
+    /// exist (created via `add_path` or by receiving packets on a new path).
+    ///
+    /// In single-path mode, the old active path is marked as non-active.
+    /// In multipath mode, multiple paths can remain active simultaneously.
+    ///
+    /// If the target path has not been validated yet, path validation will be
+    /// initiated automatically.
     #[doc(hidden)]
     pub fn migrate_path(&mut self, local_addr: SocketAddr, remote_addr: SocketAddr) -> Result<()> {
-        // TODO: support migration
-        Err(Error::InternalError)
+        // Migration is only allowed after handshake is complete
+        if !self.flags.contains(HandshakeCompleted) {
+            return Err(Error::InvalidOperation("handshake not completed".into()));
+        }
+
+        // Find the target path
+        let pid = self
+            .paths
+            .get_path_id(&(local_addr, remote_addr))
+            .ok_or(Error::InvalidOperation("path not found".into()))?;
+
+        // Check that the path is not in a failed state
+        let path = self.paths.get(pid)?;
+        if path.state() == path::PathState::Failed {
+            return Err(Error::InvalidOperation("path validation failed".into()));
+        }
+
+        // Check if the path is already active
+        if path.active() {
+            return Ok(());
+        }
+
+        // Ensure the path has a dcid_seq allocated
+        // If not, try to allocate one from available connection IDs
+        let path = self.paths.get_mut(pid)?;
+        if path.dcid_seq.is_none() {
+            let dcid_seq = if self.cids.zero_length_dcid() {
+                Some(0)
+            } else {
+                self.cids.lowest_unused_dcid_seq()
+            };
+
+            if let Some(seq) = dcid_seq {
+                path.dcid_seq = Some(seq);
+                self.cids.mark_dcid_used(seq, pid)?;
+            } else {
+                // No available connection ID for migration
+                return Err(Error::InvalidOperation(
+                    "no available connection ID".into(),
+                ));
+            }
+        }
+
+        // In non-multipath mode, mark the old active path as non-active
+        if !self.flags.contains(EnableMultipath) {
+            if let Ok(old_active_path) = self.paths.get_active_mut() {
+                old_active_path.set_active(false);
+            }
+        }
+
+        // Set the new path as active
+        let path = self.paths.get_mut(pid)?;
+        path.set_active(true);
+
+        // If the path is not validated, initiate path validation
+        if !path.validated() && !path.path_chal_initiated() {
+            path.initiate_path_chal();
+        }
+
+        self.mark_tickable(true);
+        Ok(())
     }
 
     /// Return an iterator over path addresses.
@@ -4556,6 +4665,14 @@ struct HandshakeStatus {
 
     /// whether the connection handshake is complete.
     completed: bool,
+
+    /// Whether this endpoint is a server.
+    is_server: bool,
+
+    /// Whether the server is at the anti-amplification limit.
+    /// This is true when the server cannot send any more data until it
+    /// receives more data from the client.
+    at_amplification_limit: bool,
 }
 
 #[cfg(test)]

@@ -758,6 +758,10 @@ impl CongestionController for Copa {
                 .saturating_add(lost_bytes);
         }
     }
+
+    fn set_max_datagram_size(&mut self, size: u64) {
+        self.config.max_datagram_size = size;
+    }
 }
 
 #[cfg(test)]

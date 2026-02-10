@@ -1111,6 +1111,9 @@ pub struct PathStats {
     /// Total loss events.
     pub loss_event_count: u64,
 
+    /// Total spurious loss count (packets acknowledged after being declared lost).
+    pub spurious_loss_count: u64,
+
     /// Total congestion window limited events.
     pub cwnd_limited_count: u64,
 
