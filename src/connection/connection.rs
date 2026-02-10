@@ -149,6 +149,12 @@ pub struct Connection {
     /// For server, it is the resume address token to issue to the client.
     token: Option<Vec<u8>>,
 
+    /// Received DATAGRAM frames waiting to be read by the application.
+    dgram_recv_queue: VecDeque<Bytes>,
+
+    /// DATAGRAM frames queued for sending.
+    dgram_send_queue: VecDeque<Bytes>,
+
     /// Internal Identifier of connection on the Endpoint.
     index: Option<u64>,
 
@@ -271,6 +277,8 @@ impl Connection {
             odcid: None,
             rscid: None,
             token: None,
+            dgram_recv_queue: VecDeque::new(),
+            dgram_send_queue: VecDeque::new(),
             index: None,
             events: EventQueue::default(),
             queues: None,
@@ -994,6 +1002,17 @@ impl Connection {
             Frame::StreamsBlocked { bidi, max } => {
                 self.streams.on_streams_blocked_frame_received(max, bidi)?;
             }
+
+            Frame::Datagram { data } => {
+                // Check that we advertised datagram support
+                if self.local_transport_params.max_datagram_frame_size.is_none() {
+                    return Err(Error::ProtocolViolation);
+                }
+                if self.dgram_recv_queue.len() < 128 {
+                    self.dgram_recv_queue.push_back(data);
+                    self.events.add(Event::DatagramReceived);
+                }
+            }
         }
 
         Ok(())
@@ -1508,6 +1527,9 @@ impl Connection {
                             debug!("{} path {:?} MTU is {} now", self.trace_id, path, current);
                         }
                     }
+
+                    // Datagrams are fire-and-forget; no action on ACK.
+                    Frame::Datagram { .. } => (),
 
                     _ => (),
                 }
@@ -2035,6 +2057,9 @@ impl Connection {
 
         // Write a NEW_TOKEN frame
         self.try_write_new_token_frame(out, st, pkt_type, path_id)?;
+
+        // Write DATAGRAM frames (RFC 9221)
+        self.try_write_datagram_frames(out, st, pkt_type)?;
 
         // Write a PING frame
         if ((st.ack_elicit_required && !st.ack_eliciting)
@@ -2677,6 +2702,39 @@ impl Connection {
         Ok(())
     }
 
+    /// Write queued DATAGRAM frames into the packet payload buffer.
+    ///
+    /// Datagrams are sent best-effort. If the frame does not fit in the
+    /// remaining packet space it is dropped (fire-and-forget semantics
+    /// per RFC 9221).
+    fn try_write_datagram_frames(
+        &mut self,
+        out: &mut [u8],
+        st: &mut FrameWriteStatus,
+        pkt_type: PacketType,
+    ) -> Result<()> {
+        if pkt_type != PacketType::OneRTT || self.is_closing() {
+            return Ok(());
+        }
+        let peer_max = match self.peer_transport_params.max_datagram_frame_size {
+            Some(v) if v > 0 => v as usize,
+            _ => return Ok(()),
+        };
+
+        while let Some(data) = self.dgram_send_queue.pop_front() {
+            let frame = Frame::Datagram { data };
+            let wire = frame.wire_len();
+            if wire > peer_max || wire > out.len() - st.written {
+                // Frame too large or packet full – drop it.
+                break;
+            }
+            Connection::write_frame_to_packet(frame, out, st)?;
+            st.ack_eliciting = true;
+            st.in_flight = true;
+        }
+        Ok(())
+    }
+
     /// Populate buffered frame to packet payload buffer.
     fn try_write_buffered_frames(
         &mut self,
@@ -2979,6 +3037,9 @@ impl Connection {
                             );
                         }
                     }
+
+                    // DATAGRAM frames are never retransmitted (RFC 9221).
+                    Frame::Datagram { .. } => (),
 
                     _ => (),
                 }
@@ -4015,6 +4076,68 @@ impl Connection {
     pub fn stream_want_read(&mut self, stream_id: u64, want: bool) -> Result<()> {
         self.mark_tickable(true);
         self.streams.want_read(stream_id, want)
+    }
+
+    /// Receive an incoming datagram from the peer.
+    ///
+    /// Returns the datagram payload, or `Error::Done` when the receive
+    /// queue is empty. Datagrams are delivered in FIFO order.
+    pub fn dgram_recv(&mut self) -> Result<Bytes> {
+        self.dgram_recv_queue.pop_front().ok_or(Error::Done)
+    }
+
+    /// Return `true` if there are datagrams waiting to be read.
+    pub fn dgram_readable(&self) -> bool {
+        !self.dgram_recv_queue.is_empty()
+    }
+
+    /// Queue a datagram for sending to the peer.
+    ///
+    /// Returns `Error::InvalidState` if the peer has not advertised
+    /// datagram support. Returns `Error::BufferTooShort` if the
+    /// payload exceeds the peer's `max_datagram_frame_size` limit.
+    pub fn dgram_send(&mut self, data: Bytes) -> Result<()> {
+        let peer_max = self
+            .peer_transport_params
+            .max_datagram_frame_size
+            .ok_or(Error::InvalidState("peer does not support datagrams".into()))?;
+        let wire = 1 + codec::encode_varint_len(data.len() as u64) + data.len();
+        if wire > peer_max as usize {
+            return Err(Error::BufferTooShort);
+        }
+        if self.dgram_send_queue.len() >= 128 {
+            // Drop oldest to make room (tail-drop).
+            self.dgram_send_queue.pop_front();
+        }
+        self.dgram_send_queue.push_back(data);
+        self.mark_tickable(true);
+        Ok(())
+    }
+
+    /// Return the maximum datagram payload size the peer will accept,
+    /// or `None` if the peer has not advertised datagram support.
+    ///
+    /// The peer's `max_datagram_frame_size` includes frame overhead
+    /// (1 byte type + varint length), so we subtract that here.
+    pub fn dgram_max_payload_size(&self) -> Option<usize> {
+        self.peer_transport_params
+            .max_datagram_frame_size
+            .map(|frame_max| {
+                let max = frame_max as usize;
+                // Overhead: 1 byte frame type (0x31) + varint-encoded payload length.
+                // Use (max - 1) as upper bound for the payload length varint.
+                let overhead = 1 + codec::encode_varint_len(max.saturating_sub(1) as u64);
+                max.saturating_sub(overhead)
+            })
+    }
+
+    /// Return `true` if datagrams can be sent (peer supports them and
+    /// the send queue is not full).
+    pub fn dgram_sendable(&self) -> bool {
+        self.peer_transport_params
+            .max_datagram_frame_size
+            .is_some()
+            && self.dgram_send_queue.len() < 128
     }
 
     /// Read data from a stream

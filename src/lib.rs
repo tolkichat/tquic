@@ -780,6 +780,17 @@ impl Config {
         self.local_transport_params.disable_encryption = !v;
     }
 
+    /// Set the `max_datagram_frame_size` transport parameter.
+    /// A value of 0 disables datagram support. The default is disabled.
+    /// See RFC 9221.
+    pub fn set_max_datagram_frame_size(&mut self, v: u64) {
+        if v == 0 {
+            self.local_transport_params.max_datagram_frame_size = None;
+        } else {
+            self.local_transport_params.max_datagram_frame_size = Some(v);
+        }
+    }
+
     /// Set TLS config.
     pub fn set_tls_config(&mut self, tls_config: tls::TlsConfig) {
         self.set_tls_config_selector(Arc::new(tls::DefaultTlsConfigSelector {
@@ -991,6 +1002,9 @@ enum Event {
 
     /// The stream is closed.
     StreamClosed(u64),
+
+    /// A DATAGRAM frame has been received. See RFC 9221.
+    DatagramReceived,
 }
 
 #[derive(Default)]
@@ -1091,6 +1105,10 @@ pub trait TransportHandler {
 
     /// Called when client receives a token in NEW_TOKEN frame.
     fn on_new_token(&mut self, conn: &mut Connection, token: Vec<u8>);
+
+    /// Called when one or more DATAGRAM frames have been received.
+    /// Use `Connection::dgram_recv()` to retrieve the data.
+    fn on_dgram_readable(&mut self, _conn: &mut Connection) {}
 }
 
 /// The PacketSendHandler lists the callbacks used by the endpoint to
@@ -1359,3 +1377,6 @@ pub mod timer_queue;
 mod token;
 mod trans_param;
 mod window;
+
+#[cfg(feature = "tokio-runtime")]
+pub mod tokio_adapter;

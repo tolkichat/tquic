@@ -580,6 +580,10 @@ impl Endpoint {
                     self.handler.on_stream_closed(conn, stream_id);
                     conn.stream_destroy(stream_id);
                 }
+
+                Event::DatagramReceived => {
+                    self.handler.on_dgram_readable(conn);
+                }
             }
             if conn.is_closed() {
                 return false;

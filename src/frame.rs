@@ -178,6 +178,10 @@ pub enum Frame {
         seq_num: u64,
         status: u64,
     },
+
+    /// DATAGRAM frame (types 0x30 and 0x31) is used to send unreliable data
+    /// without associated stream state. See RFC 9221.
+    Datagram { data: Bytes },
 }
 
 impl Frame {
@@ -358,6 +362,26 @@ impl Frame {
                 seq_num: b.read_varint()?,
                 status: b.read_varint()?,
             },
+
+            // DATAGRAM frame: 0x30 = no length, 0x31 = with varint length
+            0x30 => {
+                let start = buf.len() - b.len();
+                let length = b.len();
+                let data = buf.slice(start..(start + length));
+                b.skip(length)?;
+                Frame::Datagram { data }
+            }
+
+            0x31 => {
+                let length = b.read_varint()? as usize;
+                if length > b.len() {
+                    return Err(Error::BufferTooShort);
+                }
+                let start = buf.len() - b.len();
+                let data = buf.slice(start..(start + length));
+                b.skip(length)?;
+                Frame::Datagram { data }
+            }
 
             _ => return Err(Error::FrameEncodingError),
         };
@@ -609,6 +633,12 @@ impl Frame {
                 b.write_varint(*seq_num)?;
                 b.write_varint(*status)?;
             }
+
+            Frame::Datagram { data } => {
+                b.write_varint(0x31)?;
+                b.write_varint(data.len() as u64)?;
+                b.write(data.as_ref())?;
+            }
         }
 
         Ok(len - b.len())
@@ -766,6 +796,10 @@ impl Frame {
                 4 + codec::encode_varint_len(*dcid_seq_num)
                     + codec::encode_varint_len(*seq_num)
                     + codec::encode_varint_len(*status)
+            }
+
+            Frame::Datagram { data } => {
+                1 + codec::encode_varint_len(data.len() as u64) + data.len()
             }
         }
     }
@@ -931,6 +965,11 @@ impl Frame {
             Frame::PathStatus { .. } => QuicFrame::Unknown {
                 raw_frame_type: 0x15228c06,
                 frame_type_value: None,
+                raw: None,
+            },
+
+            Frame::Datagram { data } => QuicFrame::Datagram {
+                length: data.len() as u64,
                 raw: None,
             },
         }
@@ -1111,6 +1150,10 @@ impl std::fmt::Debug for Frame {
                     f,
                     "PATH_STATUS dcid_seq_num={dcid_seq_num:x} seq_num={seq_num:x} status={status:x}",
                 )?;
+            }
+
+            Frame::Datagram { data } => {
+                write!(f, "DATAGRAM len={}", data.len())?;
             }
         }
 
@@ -1903,4 +1946,41 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn datagram_with_length() -> Result<()> {
+        let payload = Bytes::copy_from_slice(&[0xaa; 20]);
+        let frame = Frame::Datagram { data: payload.clone() };
+        assert_eq!(format!("{:?}", &frame), "DATAGRAM len=20");
+        let mut buf = [0; 128];
+        let len = frame.to_bytes(&mut buf[..])?;
+        assert_eq!(len, frame.wire_len());
+        assert_eq!(len, 22);
+        let mut buf = Bytes::copy_from_slice(&buf[..len]);
+        assert_eq!((frame, 22), Frame::from_bytes(&mut buf, PacketType::OneRTT)?);
+        Ok(())
+    }
+
+    #[test]
+    fn datagram_without_length() -> Result<()> {
+        let payload = b"hello";
+        let mut raw = vec![0x30];
+        raw.extend_from_slice(payload);
+        let mut buf = Bytes::from(raw);
+        let (frame, consumed) = Frame::from_bytes(&mut buf, PacketType::OneRTT)?;
+        assert_eq!(consumed, 6);
+        match &frame {
+            Frame::Datagram { data } => assert_eq!(data.as_ref(), payload),
+            _ => panic!("expected Datagram frame"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn datagram_ack_eliciting_and_not_probing() {
+        let frame = Frame::Datagram { data: Bytes::from_static(b"test") };
+        assert!(frame.ack_eliciting());
+        assert!(!frame.probing());
+    }
+
 }

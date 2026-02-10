@@ -121,6 +121,12 @@ pub struct TransportParams {
     /// completely trust the path between themselves.
     /// See draft-banks-quic-disable-encryption-00.
     pub disable_encryption: bool,
+
+    /// The maximum size of a DATAGRAM frame (including the frame type, length,
+    /// and payload) that the endpoint is willing to receive.
+    /// A value of 0 or absence means datagrams are not supported.
+    /// See RFC 9221.
+    pub max_datagram_frame_size: Option<u64>,
 }
 
 impl TransportParams {
@@ -266,6 +272,12 @@ impl TransportParams {
                     tp.disable_encryption = true;
                 }
 
+                0x0020 => {
+                    let v = val.read_varint()?;
+                    // RFC 9221: value 0 means no datagram support (same as absent).
+                    tp.max_datagram_frame_size = if v == 0 { None } else { Some(v) };
+                }
+
                 // Ignore unknown parameters.
                 _ => (),
             }
@@ -404,6 +416,12 @@ impl TransportParams {
             buf.write_varint(0)?;
         }
 
+        if let Some(max_dgram) = tp.max_datagram_frame_size {
+            buf.write_varint(0x0020)?;
+            buf.write_varint(codec::encode_varint_len(max_dgram) as u64)?;
+            buf.write_varint(max_dgram)?;
+        }
+
         Ok(len - buf.len())
     }
 
@@ -438,7 +456,7 @@ impl TransportParams {
             initial_max_streams_bidi: Some(self.initial_max_streams_bidi),
             initial_max_streams_uni: Some(self.initial_max_streams_uni),
             preferred_address: None,
-            max_datagram_frame_size: None,
+            max_datagram_frame_size: self.max_datagram_frame_size,
             grease_quic_bit: None,
         }
     }
@@ -483,6 +501,7 @@ impl Default for TransportParams {
 
             enable_multipath: false,
             disable_encryption: false,
+            max_datagram_frame_size: None,
         }
     }
 }
@@ -583,6 +602,7 @@ mod tests {
             retry_source_connection_id: None,
             enable_multipath: true,
             disable_encryption: false,
+            max_datagram_frame_size: Some(65535),
         };
 
         // encode on the client side
@@ -627,6 +647,7 @@ mod tests {
             retry_source_connection_id: Some(ConnectionId::random()),
             enable_multipath: false,
             disable_encryption: true,
+            max_datagram_frame_size: None,
         };
 
         // encode on the server side
