@@ -1950,14 +1950,19 @@ mod tests {
     #[test]
     fn datagram_with_length() -> Result<()> {
         let payload = Bytes::copy_from_slice(&[0xaa; 20]);
-        let frame = Frame::Datagram { data: payload.clone() };
+        let frame = Frame::Datagram {
+            data: payload.clone(),
+        };
         assert_eq!(format!("{:?}", &frame), "DATAGRAM len=20");
         let mut buf = [0; 128];
         let len = frame.to_bytes(&mut buf[..])?;
         assert_eq!(len, frame.wire_len());
         assert_eq!(len, 22);
         let mut buf = Bytes::copy_from_slice(&buf[..len]);
-        assert_eq!((frame, 22), Frame::from_bytes(&mut buf, PacketType::OneRTT)?);
+        assert_eq!(
+            (frame, 22),
+            Frame::from_bytes(&mut buf, PacketType::OneRTT)?
+        );
         Ok(())
     }
 
@@ -1978,9 +1983,10 @@ mod tests {
 
     #[test]
     fn datagram_ack_eliciting_and_not_probing() {
-        let frame = Frame::Datagram { data: Bytes::from_static(b"test") };
+        let frame = Frame::Datagram {
+            data: Bytes::from_static(b"test"),
+        };
         assert!(frame.ack_eliciting());
         assert!(!frame.probing());
     }
-
 }

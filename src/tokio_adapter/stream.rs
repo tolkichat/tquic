@@ -42,10 +42,7 @@ pub(crate) enum StreamCmd {
         result_tx: oneshot::Sender<Result<(Vec<u8>, bool), TquicError>>,
     },
     /// Shutdown one direction of a stream.
-    Shutdown {
-        stream_id: u64,
-        direction: Shutdown,
-    },
+    Shutdown { stream_id: u64, direction: Shutdown },
 }
 
 /// Async send half of a QUIC stream.
@@ -84,11 +81,7 @@ impl SendStream {
     }
 
     /// Send a write command to the driver and await the result.
-    async fn write_inner(
-        &self,
-        buf: &[u8],
-        fin: bool,
-    ) -> Result<usize, AsyncError> {
+    async fn write_inner(&self, buf: &[u8], fin: bool) -> Result<usize, AsyncError> {
         let (result_tx, result_rx) = oneshot::channel();
         let cmd = StreamCmd::Write {
             stream_id: self.stream_id,
@@ -129,10 +122,7 @@ impl RecvStream {
     ///
     /// Returns `Ok(Some(n))` with bytes read, or `Ok(None)` if
     /// the stream has been fully received (FIN).
-    pub async fn read(
-        &self,
-        buf: &mut [u8],
-    ) -> Result<Option<usize>, AsyncError> {
+    pub async fn read(&self, buf: &mut [u8]) -> Result<Option<usize>, AsyncError> {
         self.readable.notified().await;
         let (result_tx, result_rx) = oneshot::channel();
         let cmd = StreamCmd::Read {

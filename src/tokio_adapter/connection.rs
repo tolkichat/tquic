@@ -61,10 +61,7 @@ pub(crate) enum ConnCmd {
         result_tx: oneshot::Sender<Result<Bytes, AsyncError>>,
     },
     /// Close the connection.
-    Close {
-        error_code: u64,
-        reason: Vec<u8>,
-    },
+    Close { error_code: u64, reason: Vec<u8> },
     /// Retrieve connection statistics.
     GetStats {
         result_tx: oneshot::Sender<ConnectionStats>,
@@ -108,17 +105,13 @@ impl TquicConnection {
     }
 
     /// Open a new bidirectional QUIC stream.
-    pub async fn open_bi(
-        &self,
-    ) -> Result<(SendStream, RecvStream), AsyncError> {
+    pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), AsyncError> {
         let (result_tx, result_rx) = oneshot::channel();
         self.cmd_tx
             .send(ConnCmd::OpenBi { result_tx })
             .await
             .map_err(|_| AsyncError::ChannelClosed)?;
-        result_rx
-            .await
-            .map_err(|_| AsyncError::ChannelClosed)?
+        result_rx.await.map_err(|_| AsyncError::ChannelClosed)?
     }
 
     /// Open a new unidirectional QUIC stream.
@@ -128,17 +121,13 @@ impl TquicConnection {
             .send(ConnCmd::OpenUni { result_tx })
             .await
             .map_err(|_| AsyncError::ChannelClosed)?;
-        result_rx
-            .await
-            .map_err(|_| AsyncError::ChannelClosed)?
+        result_rx.await.map_err(|_| AsyncError::ChannelClosed)?
     }
 
     /// Accept an incoming bidirectional stream from the peer.
     ///
     /// Returns `None` if the connection has been closed.
-    pub async fn accept_bi(
-        &mut self,
-    ) -> Option<(SendStream, RecvStream)> {
+    pub async fn accept_bi(&mut self) -> Option<(SendStream, RecvStream)> {
         self.incoming_bi_rx.recv().await
     }
 
@@ -150,18 +139,13 @@ impl TquicConnection {
     }
 
     /// Send an unreliable datagram over the connection.
-    pub async fn send_datagram(
-        &self,
-        data: Bytes,
-    ) -> Result<(), AsyncError> {
+    pub async fn send_datagram(&self, data: Bytes) -> Result<(), AsyncError> {
         let (result_tx, result_rx) = oneshot::channel();
         self.cmd_tx
             .send(ConnCmd::SendDatagram { data, result_tx })
             .await
             .map_err(|_| AsyncError::ChannelClosed)?;
-        result_rx
-            .await
-            .map_err(|_| AsyncError::ChannelClosed)?
+        result_rx.await.map_err(|_| AsyncError::ChannelClosed)?
     }
 
     /// Receive an unreliable datagram from the connection.
@@ -171,9 +155,7 @@ impl TquicConnection {
             .send(ConnCmd::RecvDatagram { result_tx })
             .await
             .map_err(|_| AsyncError::ChannelClosed)?;
-        result_rx
-            .await
-            .map_err(|_| AsyncError::ChannelClosed)?
+        result_rx.await.map_err(|_| AsyncError::ChannelClosed)?
     }
 
     /// Close the connection with the given error code and reason.
@@ -191,9 +173,7 @@ impl TquicConnection {
             .send(ConnCmd::GetStats { result_tx })
             .await
             .map_err(|_| AsyncError::ChannelClosed)?;
-        result_rx
-            .await
-            .map_err(|_| AsyncError::ChannelClosed)
+        result_rx.await.map_err(|_| AsyncError::ChannelClosed)
     }
 
     /// Return the remote peer's address.

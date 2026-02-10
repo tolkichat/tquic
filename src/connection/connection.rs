@@ -573,11 +573,9 @@ impl Connection {
             cid_seq = Some(seq as u32)
         }
 
-        let (key, attempt_key_update) = self.tls_session.select_key(
-            handshake_confirmed,
-            &hdr,
-            space,
-        )?;
+        let (key, attempt_key_update) =
+            self.tls_session
+                .select_key(handshake_confirmed, &hdr, space)?;
         let mut payload = if !is_encryption_disabled {
             packet::decrypt_payload(buf, payload_offset, payload_len, cid_seq, pkt_num, key)
                 .map_err(|_| Error::Done)?
@@ -1005,7 +1003,11 @@ impl Connection {
 
             Frame::Datagram { data } => {
                 // Check that we advertised datagram support
-                if self.local_transport_params.max_datagram_frame_size.is_none() {
+                if self
+                    .local_transport_params
+                    .max_datagram_frame_size
+                    .is_none()
+                {
                     return Err(Error::ProtocolViolation);
                 }
                 if self.dgram_recv_queue.len() < 128 {
@@ -3373,8 +3375,9 @@ impl Connection {
                                 continue;
                             }
                             // Compute path-specific anti-amplification limit status.
-                            let at_amplification_limit =
-                                is_server && !path.verified_peer_address && path.anti_ampl_limit == 0;
+                            let at_amplification_limit = is_server
+                                && !path.verified_peer_address
+                                && path.anti_ampl_limit == 0;
                             let handshake_status = HandshakeStatus {
                                 derived_handshake_keys,
                                 peer_verified_address,
@@ -3665,8 +3668,12 @@ impl Connection {
         if let Ok(path) = self.paths.get_active() {
             let handshake_status = self.handshake_status(path);
             if let Ok(path) = self.paths.get_active_mut() {
-                path.recovery
-                    .on_pkt_num_space_discarded(sid, &mut self.spaces, handshake_status, now);
+                path.recovery.on_pkt_num_space_discarded(
+                    sid,
+                    &mut self.spaces,
+                    handshake_status,
+                    now,
+                );
             }
         }
     }
@@ -3907,7 +3914,9 @@ impl Connection {
         if path.active() {
             let active_count = self.paths.iter().filter(|(_, p)| p.active()).count();
             if active_count <= 1 {
-                return Err(Error::InvalidOperation("cannot abandon last active path".into()));
+                return Err(Error::InvalidOperation(
+                    "cannot abandon last active path".into(),
+                ));
             }
         }
 
@@ -3998,9 +4007,7 @@ impl Connection {
                 self.cids.mark_dcid_used(seq, pid)?;
             } else {
                 // No available connection ID for migration
-                return Err(Error::InvalidOperation(
-                    "no available connection ID".into(),
-                ));
+                return Err(Error::InvalidOperation("no available connection ID".into()));
             }
         }
 
@@ -4097,10 +4104,12 @@ impl Connection {
     /// datagram support. Returns `Error::BufferTooShort` if the
     /// payload exceeds the peer's `max_datagram_frame_size` limit.
     pub fn dgram_send(&mut self, data: Bytes) -> Result<()> {
-        let peer_max = self
-            .peer_transport_params
-            .max_datagram_frame_size
-            .ok_or(Error::InvalidState("peer does not support datagrams".into()))?;
+        let peer_max =
+            self.peer_transport_params
+                .max_datagram_frame_size
+                .ok_or(Error::InvalidState(
+                    "peer does not support datagrams".into(),
+                ))?;
         let wire = 1 + codec::encode_varint_len(data.len() as u64) + data.len();
         if wire > peer_max as usize {
             return Err(Error::BufferTooShort);
@@ -4134,9 +4143,7 @@ impl Connection {
     /// Return `true` if datagrams can be sent (peer supports them and
     /// the send queue is not full).
     pub fn dgram_sendable(&self) -> bool {
-        self.peer_transport_params
-            .max_datagram_frame_size
-            .is_some()
+        self.peer_transport_params.max_datagram_frame_size.is_some()
             && self.dgram_send_queue.len() < 128
     }
 
@@ -8324,7 +8331,9 @@ pub(crate) mod tests {
         TestPair::conn_packets_in(&mut test_pair.server, packets)?;
 
         // Migrate to the new path
-        test_pair.client.migrate_path(new_client_addr, server_addr)?;
+        test_pair
+            .client
+            .migrate_path(new_client_addr, server_addr)?;
 
         // Verify connection still works — send and receive data on migrated path
         let mut buf = vec![0; 2048];
@@ -8344,8 +8353,13 @@ pub(crate) mod tests {
         TestPair::conn_packets_in(&mut test_pair.client, packets)?;
 
         // Verify path stats exist for the new path
-        let stats = test_pair.client.get_path_stats(new_client_addr, server_addr)?;
-        assert!(stats.sent_count > 0, "migrated path should have sent packets");
+        let stats = test_pair
+            .client
+            .get_path_stats(new_client_addr, server_addr)?;
+        assert!(
+            stats.sent_count > 0,
+            "migrated path should have sent packets"
+        );
 
         Ok(())
     }

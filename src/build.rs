@@ -28,7 +28,10 @@ const CMAKE_PARAMS_IOS: &[(&str, &[(&str, &str)])] = &[
             ("CMAKE_OSX_ARCHITECTURES", "arm64"),
             ("CMAKE_OSX_SYSROOT", "iphoneos"),
             ("CMAKE_OSX_DEPLOYMENT_TARGET", "12.0"),
-            ("CMAKE_ASM_FLAGS", "-fembed-bitcode -target arm64-apple-ios12.0"),
+            (
+                "CMAKE_ASM_FLAGS",
+                "-fembed-bitcode -target arm64-apple-ios12.0",
+            ),
             ("CMAKE_C_FLAGS", "-mios-version-min=12.0"),
             ("CMAKE_CXX_FLAGS", "-mios-version-min=12.0"),
         ],

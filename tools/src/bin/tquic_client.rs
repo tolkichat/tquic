@@ -342,7 +342,12 @@ pub struct ClientOpt {
     pub range: Option<String>,
 
     /// Custom request headers. Can be specified multiple times. Format: "Name: Value"
-    #[clap(short = 'H', long = "header", value_name = "HEADER", help_heading = "Protocol")]
+    #[clap(
+        short = 'H',
+        long = "header",
+        value_name = "HEADER",
+        help_heading = "Protocol"
+    )]
     pub headers: Vec<String>,
 }
 

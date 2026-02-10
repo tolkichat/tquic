@@ -1887,7 +1887,10 @@ mod tests {
             now,
         )?;
         assert_eq!(lost_pkts, 1, "packet 1 should be declared lost");
-        assert_eq!(recovery.pkt_thresh, 3, "pkt_thresh unchanged before spurious detection");
+        assert_eq!(
+            recovery.pkt_thresh, 3,
+            "pkt_thresh unchanged before spurious detection"
+        );
 
         // Now ACK packet 1 — it was declared lost but is now acked = spurious
         now += Duration::from_millis(10);

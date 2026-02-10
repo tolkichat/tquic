@@ -74,10 +74,7 @@ impl TquicEndpoint {
     ///
     /// Spawns the driver event loop on a `LocalSet`. The returned
     /// handle can be used from any tokio task.
-    pub async fn client(
-        bind: SocketAddr,
-        config: crate::Config,
-    ) -> Result<Self, AsyncError> {
+    pub async fn client(bind: SocketAddr, config: crate::Config) -> Result<Self, AsyncError> {
         super::driver::spawn_driver(bind, config, false).await
     }
 
@@ -85,10 +82,7 @@ impl TquicEndpoint {
     ///
     /// Spawns the driver event loop on a `LocalSet`. The returned
     /// handle can be used from any tokio task.
-    pub async fn server(
-        bind: SocketAddr,
-        config: crate::Config,
-    ) -> Result<Self, AsyncError> {
+    pub async fn server(bind: SocketAddr, config: crate::Config) -> Result<Self, AsyncError> {
         super::driver::spawn_driver(bind, config, true).await
     }
 
@@ -154,8 +148,6 @@ impl TquicEndpoint {
             })
             .await
             .map_err(|_| AsyncError::ChannelClosed)?;
-        result_rx
-            .await
-            .map_err(|_| AsyncError::ChannelClosed)?
+        result_rx.await.map_err(|_| AsyncError::ChannelClosed)?
     }
 }
