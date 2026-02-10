@@ -268,7 +268,6 @@ impl Recovery {
         }
 
         // Update RTT estimation
-        // TODO: check ack_delay against amx_ack_delay
         if let Some(rtt) = rtt_sample {
             // When adjusting an RTT sample using peer-reported acknowledgment
             // delays, an endpoint:
@@ -280,6 +279,11 @@ impl Recovery {
             // max_ack_delay after the handshake is confirmed;
             // See RFC 9000 Section 5.3
             let ack_delay = Duration::from_micros(ack_delay);
+            let ack_delay = if handshake_status.completed {
+                cmp::min(ack_delay, self.max_ack_delay)
+            } else {
+                ack_delay
+            };
             if !rtt.is_zero() {
                 self.rtt.update(ack_delay, rtt);
             }
