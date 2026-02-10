@@ -278,6 +278,12 @@ impl Recovery {
             // - MUST use the lesser of the acknowledgment delay and the peer's
             // max_ack_delay after the handshake is confirmed;
             // See RFC 9000 Section 5.3
+            //
+            // RU: При корректировке RTT с использованием ack_delay от пира:
+            // - МОЖНО игнорировать ack_delay для Initial-пакетов (пир их не задерживает).
+            // - СЛЕДУЕТ игнорировать max_ack_delay пира до подтверждения хендшейка.
+            // - ОБЯЗАНЫ использовать min(ack_delay, max_ack_delay) после хендшейка,
+            //   чтобы пир не мог занизить RTT нереально большой задержкой.
             let ack_delay = Duration::from_micros(ack_delay);
             let ack_delay = if handshake_status.completed {
                 cmp::min(ack_delay, self.max_ack_delay)
@@ -1700,6 +1706,212 @@ mod tests {
 
         // PTO reach the upper limit.
         assert_eq!(calculate_pto_with_count(100), (MAX_PTO_UT, MAX_PTO_UT));
+
+        Ok(())
+    }
+
+    #[test]
+    fn ack_delay_capped_after_handshake() -> Result<()> {
+        let mut conf = new_test_recovery_config();
+        conf.max_ack_delay = Duration::from_millis(40);
+        let mut recovery = Recovery::new(&conf);
+        let mut spaces = PacketNumSpaceMap::new();
+        let space_id = SpaceId::Data;
+        let status = HandshakeStatus {
+            derived_handshake_keys: true,
+            peer_verified_address: true,
+            completed: true,
+            is_server: false,
+            at_amplification_limit: false,
+        };
+        let mut now = Instant::now();
+
+        // Send packets 0 and 1 at T=0
+        let sent_pkt0 = new_test_sent_packet(0, 1000, now);
+        recovery.on_packet_sent(sent_pkt0, space_id, &mut spaces, status, now);
+        let sent_pkt1 = new_test_sent_packet(1, 1000, now);
+        recovery.on_packet_sent(sent_pkt1, space_id, &mut spaces, status, now);
+
+        // First ACK at T+40ms for packet 0, ack_delay=0
+        // Establishes baseline: srtt=40ms, min_rtt=40ms (first sample ignores ack_delay)
+        now += Duration::from_millis(40);
+        let mut acked = RangeSet::default();
+        acked.insert(0..1);
+        recovery.on_ack_received(
+            &acked,
+            0,
+            space_id,
+            &mut spaces,
+            status,
+            #[cfg(feature = "qlog")]
+            None,
+            now,
+        )?;
+        assert_eq!(recovery.rtt.smoothed_rtt(), Duration::from_millis(40));
+
+        // Second ACK at T+200ms for packet 1, ack_delay=80ms (> max_ack_delay=40ms)
+        // raw_rtt = 200ms (sent at T=0, acked at T=200ms)
+        // With completed=true: ack_delay capped to 40ms
+        // adjusted_rtt = 200ms - 40ms = 160ms
+        // srtt = (7*40 + 160)/8 = 55ms
+        now += Duration::from_millis(160);
+        let mut acked2 = RangeSet::default();
+        acked2.insert(1..2);
+        recovery.on_ack_received(
+            &acked2,
+            80_000, // 80ms in microseconds
+            space_id,
+            &mut spaces,
+            status,
+            #[cfg(feature = "qlog")]
+            None,
+            now,
+        )?;
+
+        assert_eq!(
+            recovery.rtt.smoothed_rtt(),
+            Duration::from_millis(55),
+            "ack_delay should be capped to max_ack_delay (40ms) after handshake, \
+             giving adjusted_rtt=160ms and srtt=55ms, not 50ms (uncapped)"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn ack_delay_uncapped_before_handshake() -> Result<()> {
+        let mut conf = new_test_recovery_config();
+        conf.max_ack_delay = Duration::from_millis(40);
+        let mut recovery = Recovery::new(&conf);
+        let mut spaces = PacketNumSpaceMap::new();
+        let space_id = SpaceId::Data;
+        let status = HandshakeStatus {
+            derived_handshake_keys: true,
+            peer_verified_address: true,
+            completed: false,
+            is_server: false,
+            at_amplification_limit: false,
+        };
+        let mut now = Instant::now();
+
+        // Send packets 0 and 1 at T=0
+        let sent_pkt0 = new_test_sent_packet(0, 1000, now);
+        recovery.on_packet_sent(sent_pkt0, space_id, &mut spaces, status, now);
+        let sent_pkt1 = new_test_sent_packet(1, 1000, now);
+        recovery.on_packet_sent(sent_pkt1, space_id, &mut spaces, status, now);
+
+        // First ACK at T+40ms for packet 0, ack_delay=0
+        // Establishes baseline: srtt=40ms, min_rtt=40ms
+        now += Duration::from_millis(40);
+        let mut acked = RangeSet::default();
+        acked.insert(0..1);
+        recovery.on_ack_received(
+            &acked,
+            0,
+            space_id,
+            &mut spaces,
+            status,
+            #[cfg(feature = "qlog")]
+            None,
+            now,
+        )?;
+        assert_eq!(recovery.rtt.smoothed_rtt(), Duration::from_millis(40));
+
+        // Second ACK at T+200ms for packet 1, ack_delay=80ms (> max_ack_delay=40ms)
+        // raw_rtt = 200ms (sent at T=0, acked at T=200ms)
+        // With completed=false: ack_delay NOT capped, full 80ms used
+        // adjusted_rtt = 200ms - 80ms = 120ms
+        // srtt = (7*40 + 120)/8 = 50ms
+        now += Duration::from_millis(160);
+        let mut acked2 = RangeSet::default();
+        acked2.insert(1..2);
+        recovery.on_ack_received(
+            &acked2,
+            80_000, // 80ms in microseconds
+            space_id,
+            &mut spaces,
+            status,
+            #[cfg(feature = "qlog")]
+            None,
+            now,
+        )?;
+
+        assert_eq!(
+            recovery.rtt.smoothed_rtt(),
+            Duration::from_millis(50),
+            "ack_delay should NOT be capped before handshake, \
+             giving adjusted_rtt=120ms and srtt=50ms, not 55ms (capped)"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn spurious_loss_increases_pkt_thresh() -> Result<()> {
+        let conf = new_test_recovery_config();
+        let mut recovery = Recovery::new(&conf);
+        let mut spaces = PacketNumSpaceMap::new();
+        let space_id = SpaceId::Data;
+        let status = HandshakeStatus {
+            derived_handshake_keys: true,
+            peer_verified_address: true,
+            completed: true,
+            is_server: false,
+            at_amplification_limit: false,
+        };
+        let mut now = Instant::now();
+
+        // Default pkt_thresh is 3
+        assert_eq!(recovery.pkt_thresh, 3);
+
+        // Send packets 0..5
+        for pkt_num in 0..5u64 {
+            let sent_pkt = new_test_sent_packet(pkt_num, 1000, now);
+            recovery.on_packet_sent(sent_pkt, space_id, &mut spaces, status, now);
+        }
+
+        // ACK packets 0, 2, 3, 4 — skip packet 1
+        // Packet 1 should be declared lost (3 packets with higher numbers acked)
+        now += Duration::from_millis(100);
+        let mut acked = RangeSet::default();
+        acked.insert(0..1);
+        acked.insert(2..5);
+        let (lost_pkts, _lost_bytes) = recovery.on_ack_received(
+            &acked,
+            0,
+            space_id,
+            &mut spaces,
+            status,
+            #[cfg(feature = "qlog")]
+            None,
+            now,
+        )?;
+        assert_eq!(lost_pkts, 1, "packet 1 should be declared lost");
+        assert_eq!(recovery.pkt_thresh, 3, "pkt_thresh unchanged before spurious detection");
+
+        // Now ACK packet 1 — it was declared lost but is now acked = spurious
+        now += Duration::from_millis(10);
+        let mut acked2 = RangeSet::default();
+        acked2.insert(0..5);
+        recovery.on_ack_received(
+            &acked2,
+            0,
+            space_id,
+            &mut spaces,
+            status,
+            #[cfg(feature = "qlog")]
+            None,
+            now,
+        )?;
+
+        assert_eq!(
+            recovery.pkt_thresh, 4,
+            "pkt_thresh should increase after spurious loss detection"
+        );
+        assert_eq!(
+            recovery.stats.spurious_loss_count, 1,
+            "spurious_loss_count should be incremented"
+        );
 
         Ok(())
     }

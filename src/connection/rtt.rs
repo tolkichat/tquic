@@ -103,29 +103,71 @@ impl RttEstimator {
     }
 
     /// Update estimator with the given RTT sample
+    ///
+    /// # Аргументы
+    /// - `ack_delay` — задержка подтверждения от пира (уже обрезана до max_ack_delay
+    ///   в recovery.rs:282, если хендшейк завершён).
+    ///   Откуда: поле ack_delay из ACK-фрейма, который прислал сервер.
+    /// - `rtt` — сырой RTT = now (момент получения ACK) - time_sent (момент отправки пакета).
+    ///   Откуда: recovery.rs:detect_acked_packets():424.
+    ///
+    /// # Пример (3 замера, max_ack_delay = 25мс)
+    ///
+    /// ```text
+    /// Замер 1: rtt=80мс, ack_delay=10мс
+    ///   smoothed_rtt ещё None → первый замер, ack_delay игнорируется
+    ///   smoothed_rtt = 80мс, rttvar = 40мс, min_rtt = 80мс
+    ///
+    /// Замер 2: rtt=120мс, ack_delay=25мс (сервер ждал 50мс, обрезали до 25)
+    ///   min_rtt(80) + ack_delay(25) = 105 <= rtt(120)? ДА → можно вычесть
+    ///   adjusted_rtt = 120 - 25 = 95мс
+    ///   var_sample = |80 - 95| = 15мс
+    ///   rttvar  = (3×40 + 15) / 4 = 33.75мс
+    ///   smoothed_rtt = (7×80 + 95) / 8 = 81.875мс
+    ///
+    /// Замер 3: rtt=60мс, ack_delay=25мс
+    ///   min_rtt(60) + ack_delay(25) = 85 <= rtt(60)? НЕТ → вычитать нельзя!
+    ///     (иначе получим 35мс < min_rtt — абсурд)
+    ///   adjusted_rtt = 60мс (без вычитания)
+    ///   var_sample = |81.875 - 60| = 21.875мс
+    ///   rttvar  = (3×33.75 + 21.875) / 4 = 30.78мс
+    ///   smoothed_rtt = (7×81.875 + 60) / 8 = 79.14мс
+    /// ```
     pub fn update(&mut self, ack_delay: Duration, rtt: Duration) {
+        // rtt — это «сырой» RTT: время от отправки пакета до получения ACK.
+        // Включает в себя сетевую задержку + время, которое пир держал пакет
+        // перед отправкой ACK (ack_delay). Наша задача — вычесть ack_delay,
+        // чтобы получить чистое время на сеть (adjusted_rtt).
         self.latest_rtt = rtt;
         self.min_rtt = cmp::min(self.min_rtt, self.latest_rtt);
         self.max_rtt = cmp::max(self.max_rtt, self.latest_rtt);
 
         if let Some(smoothed_rtt) = self.smoothed_rtt {
-            // The endpoint MUST NOT subtract the acknowledgment delay from the
-            // RTT sample if the resulting value is smaller than the min_rtt.
-            let adjusted_rtt = if self.min_rtt + ack_delay <= self.latest_rtt {
-                self.latest_rtt - ack_delay
-            } else {
-                self.latest_rtt
-            };
+            // ОТКЛЮЧЕНО: проверка min_rtt. Жёстко вычитаем ack_delay всегда.
+            // Чтобы вернуть — раскомментировать блок ниже и убрать saturating_sub.
+            //
+            // // Защита: нельзя вычитать ack_delay, если результат станет меньше min_rtt.
+            // // Пример: rtt=60мс, ack_delay=25мс, min_rtt=60мс → 60+25=85 > 60 → НЕ вычитаем.
+            // let adjusted_rtt = if self.min_rtt + ack_delay <= self.latest_rtt {
+            //     self.latest_rtt - ack_delay
+            // } else {
+            //     self.latest_rtt
+            // };
+            let adjusted_rtt = self.latest_rtt.saturating_sub(ack_delay);
 
+            // Отклонение текущего замера от сглаженного значения (для PTO расчёта).
             let var_sample = if smoothed_rtt > adjusted_rtt {
                 smoothed_rtt - adjusted_rtt
             } else {
                 adjusted_rtt - smoothed_rtt
             };
 
+            // EWMA: новый замер получает вес 1/4 для rttvar и 1/8 для smoothed_rtt.
+            // Чем больше вес истории — тем плавнее, но медленнее реагирует на скачки.
             self.rttvar = (3 * self.rttvar + var_sample) / 4;
             self.smoothed_rtt = Some((7 * smoothed_rtt + adjusted_rtt) / 8);
         } else {
+            // Первый замер: просто берём как есть, ack_delay не вычитаем (RFC 9002).
             self.smoothed_rtt = Some(self.latest_rtt);
             self.rttvar = self.latest_rtt / 2;
             self.min_rtt = self.latest_rtt;

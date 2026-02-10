@@ -1253,6 +1253,13 @@ impl Connection {
         let max_ack_delay = time::Duration::from_millis(peer_params.max_ack_delay);
         active_path.recovery.max_ack_delay = max_ack_delay;
 
+        // Propagate peer's max_ack_delay to recovery_conf so that new paths
+        // created via add_path() (multipath) inherit the correct value.
+        // Without this, secondary paths would have max_ack_delay=0, causing
+        // the ack_delay cap (RFC 9000 §5.3) to zero out all ack_delay
+        // subtraction and inflate their RTT estimates.
+        self.recovery_conf.max_ack_delay = max_ack_delay;
+
         let max_datagram_size = peer_params.max_udp_payload_size as usize;
         active_path
             .recovery
@@ -8087,6 +8094,135 @@ pub(crate) mod tests {
                 .initiate_key_update(std::iter::once(space)),
             Err(Error::Done)
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn multipath_secondary_path_inherits_max_ack_delay() -> Result<()> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_cid_len(crate::MAX_CID_LEN);
+        client_config.enable_multipath(true);
+        client_config.set_multipath_algorithm(MultipathAlgorithm::RoundRobin);
+
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.set_cid_len(crate::MAX_CID_LEN);
+        server_config.enable_multipath(true);
+        server_config.set_multipath_algorithm(MultipathAlgorithm::RoundRobin);
+
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+
+        // Handshake — peer transport params with max_ack_delay=25ms are exchanged
+        test_pair.handshake()?;
+        assert!(test_pair.client.is_multipath());
+        assert!(test_pair.server.is_multipath());
+
+        // Advertise new CIDs and add second path
+        test_pair.advertise_new_cids()?;
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9444);
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        test_pair.add_and_validate_path(client_addr, server_addr)?;
+        assert_eq!(test_pair.client.paths_iter().count(), 2);
+        assert_eq!(test_pair.server.paths_iter().count(), 2);
+
+        // Transfer data over multipath so both paths get RTT samples
+        let mut buf = vec![0; 2048];
+        for _ in 0..50 {
+            let data = Bytes::from_static(b"test data over multipath");
+            let len = data.len();
+            assert_eq!(
+                test_pair.client.stream_write(4, data.clone(), false),
+                Ok(len)
+            );
+            let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+            TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+            assert_eq!(test_pair.server.stream_read(4, &mut buf)?, (len, false));
+
+            let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+            TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+        }
+
+        // Verify both paths on the server have reasonable RTT stats.
+        // If max_ack_delay were not inherited (defaulting to 0), secondary path
+        // srtt would be inflated because no ack_delay subtraction occurs.
+        let mut path_srtts = vec![];
+        for (_i, path) in test_pair.server.paths.iter_mut() {
+            let s = path.stats();
+            // Both paths should have sent/received data
+            assert!(s.sent_count > 0, "path should have sent packets");
+            assert!(s.recv_count > 0, "path should have received packets");
+            if s.srtt > 0 {
+                path_srtts.push(s.srtt);
+            }
+        }
+
+        // With proper max_ack_delay inheritance, all path srtts should be
+        // in the same order of magnitude (test environment has near-zero latency)
+        if path_srtts.len() >= 2 {
+            let max_srtt = *path_srtts.iter().max().unwrap();
+            let min_srtt = *path_srtts.iter().min().unwrap();
+            // In a loopback test, RTTs are very small. The key assertion is
+            // that the secondary path's srtt is not wildly inflated.
+            // With max_ack_delay=0 bug, secondary path srtt could be 10x+ higher.
+            assert!(
+                max_srtt < min_srtt * 100,
+                "secondary path srtt ({max_srtt}us) should not be wildly inflated \
+                 compared to primary ({min_srtt}us) — indicates max_ack_delay not inherited"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_path_preserves_connection() -> Result<()> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_cid_len(crate::MAX_CID_LEN);
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.set_cid_len(crate::MAX_CID_LEN);
+
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+        test_pair.handshake()?;
+
+        // Advertise new CIDs so migration has a dcid available
+        test_pair.advertise_new_cids()?;
+
+        // Add a new path from a different client address
+        let new_client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9445);
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        test_pair.client.add_path(new_client_addr, server_addr)?;
+
+        // Exchange PATH_CHALLENGE / PATH_RESPONSE to validate path
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+        TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+
+        // Migrate to the new path
+        test_pair.client.migrate_path(new_client_addr, server_addr)?;
+
+        // Verify connection still works — send and receive data on migrated path
+        let mut buf = vec![0; 2048];
+        let data = Bytes::from_static(b"data after migration");
+        let len = data.len();
+        assert_eq!(
+            test_pair.client.stream_write(4, data.clone(), false),
+            Ok(len)
+        );
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        assert_eq!(test_pair.server.stream_read(4, &mut buf)?, (len, false));
+        assert_eq!(&buf[..len], b"data after migration");
+
+        // Server replies — verify bidirectional communication
+        let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+        TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+
+        // Verify path stats exist for the new path
+        let stats = test_pair.client.get_path_stats(new_client_addr, server_addr)?;
+        assert!(stats.sent_count > 0, "migrated path should have sent packets");
 
         Ok(())
     }
