@@ -3332,7 +3332,9 @@ impl Connection {
 
                 Timer::KeyDiscard => self.tls_session.discard_prev_key(),
 
-                Timer::KeepAlive => (), // TODO: schedule an outgoing Ping
+                Timer::KeepAlive => {
+                    let _ = self.paths.mark_ping(None);
+                }
 
                 Timer::PathChallenge => self.paths.on_path_chal_timeout(now),
 
