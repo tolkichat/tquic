@@ -567,7 +567,6 @@ impl Connection {
 
         let (key, attempt_key_update) = self.tls_session.select_key(
             handshake_confirmed,
-            self.flags.contains(EnableMultipath),
             &hdr,
             space,
         )?;
@@ -593,7 +592,7 @@ impl Connection {
         );
 
         // Try to update key.
-        self.tls_session.try_update_key(
+        let key_updated = self.tls_session.try_update_key(
             &mut self.timers,
             space,
             attempt_key_update,
@@ -601,6 +600,18 @@ impl Connection {
             now,
             self.paths.max_pto(),
         )?;
+
+        // In multipath mode, when a key update occurs, reset key phase tracking
+        // in all other data spaces. This ensures all paths start fresh tracking
+        // for the new key phase.
+        if key_updated && self.flags.contains(EnableMultipath) {
+            use crate::tls::TlsSession;
+            for (_, other_space) in self.spaces.iter_mut() {
+                if other_space.is_data && other_space.id != space_id {
+                    TlsSession::reset_key_phase_tracking(other_space);
+                }
+            }
+        }
 
         // Update dcid for initial path
         self.try_set_dcid_for_initial_path(pid, &hdr)?;
@@ -7944,7 +7955,7 @@ pub(crate) mod tests {
         test_pair
             .client
             .tls_session
-            .initiate_key_update(space, false)?;
+            .initiate_key_update(std::iter::once(space))?;
 
         // Transfer some data.
         let data = Bytes::from_static(b"test data over quic");
@@ -7982,7 +7993,7 @@ pub(crate) mod tests {
         test_pair
             .client
             .tls_session
-            .initiate_key_update(space, false)?;
+            .initiate_key_update(std::iter::once(space))?;
 
         // Client send with new key.
         let data = Bytes::from_static(b"test data over quic");
@@ -8022,7 +8033,7 @@ pub(crate) mod tests {
         test_pair
             .client
             .tls_session
-            .initiate_key_update(space, false)?;
+            .initiate_key_update(std::iter::once(space))?;
         // Client send with new key.
         let data = Bytes::from_static(b"test data over quic");
         test_pair.client.stream_write(0, data.clone(), true)?;
@@ -8060,14 +8071,20 @@ pub(crate) mod tests {
         test_pair
             .client
             .tls_session
-            .initiate_key_update(space, false)?;
+            .initiate_key_update(std::iter::once(space))?;
 
-        // Client init another key update.
+        // Client init another key update - should fail since no packet with new key phase
+        // has been acknowledged yet.
+        let space = test_pair
+            .client
+            .spaces
+            .get_mut(SpaceId::Data)
+            .ok_or(Error::InternalError)?;
         assert_eq!(
             test_pair
                 .client
                 .tls_session
-                .initiate_key_update(space, false),
+                .initiate_key_update(std::iter::once(space)),
             Err(Error::Done)
         );
 
