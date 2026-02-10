@@ -17,9 +17,11 @@
 use core::str::FromStr;
 use std::time::Instant;
 
+use self::scheduler_blest::*;
 use self::scheduler_minrtt::*;
 use self::scheduler_redundant::*;
 use self::scheduler_rr::*;
+use self::scheduler_weighted::*;
 use crate::connection::path::PathMap;
 use crate::connection::space::PacketNumSpaceMap;
 use crate::connection::space::SentPacket;
@@ -83,6 +85,35 @@ pub enum MultipathAlgorithm {
     /// distribution across all path is equal. It is only used for testing
     /// purposes.
     RoundRobin,
+
+    /// The scheduler distributes packets across paths proportionally to their
+    /// estimated bandwidth capacity. Weight is calculated as cwnd/srtt.
+    /// This approach aims to maximize aggregate throughput by utilizing each
+    /// path according to its capacity.
+    Weighted,
+
+    /// BLocking ESTimation (BLEST) scheduler aims to minimize Head-of-Line
+    /// blocking by estimating when a slower path might cause the receiver to
+    /// stall. It prefers faster paths to avoid reordering delays.
+    Blest,
+}
+
+/// Multipath bonding modes that control how paths are used together.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum MultipathBondMode {
+    /// Combine bandwidth from all available paths (default).
+    /// Packets are distributed across paths according to the scheduler.
+    #[default]
+    Aggregate,
+
+    /// Use primary path with automatic failover to backup paths.
+    /// Only switches to backup when primary becomes unavailable.
+    Failover,
+
+    /// Stream-based distribution across paths.
+    /// Different streams may use different paths for load balancing.
+    LoadBalance,
 }
 
 impl FromStr for MultipathAlgorithm {
@@ -95,8 +126,28 @@ impl FromStr for MultipathAlgorithm {
             Ok(MultipathAlgorithm::Redundant)
         } else if algor.eq_ignore_ascii_case("roundrobin") {
             Ok(MultipathAlgorithm::RoundRobin)
+        } else if algor.eq_ignore_ascii_case("weighted") {
+            Ok(MultipathAlgorithm::Weighted)
+        } else if algor.eq_ignore_ascii_case("blest") {
+            Ok(MultipathAlgorithm::Blest)
         } else {
             Err(Error::InvalidConfig("unknown".into()))
+        }
+    }
+}
+
+impl FromStr for MultipathBondMode {
+    type Err = Error;
+
+    fn from_str(mode: &str) -> Result<MultipathBondMode> {
+        if mode.eq_ignore_ascii_case("aggregate") {
+            Ok(MultipathBondMode::Aggregate)
+        } else if mode.eq_ignore_ascii_case("failover") {
+            Ok(MultipathBondMode::Failover)
+        } else if mode.eq_ignore_ascii_case("loadbalance") {
+            Ok(MultipathBondMode::LoadBalance)
+        } else {
+            Err(Error::InvalidConfig("unknown bond mode".into()))
         }
     }
 }
@@ -107,6 +158,8 @@ pub(crate) fn build_multipath_scheduler(conf: &MultipathConfig) -> Box<dyn Multi
         MultipathAlgorithm::MinRtt => Box::new(MinRttScheduler::new(conf)),
         MultipathAlgorithm::Redundant => Box::new(RedundantScheduler::new(conf)),
         MultipathAlgorithm::RoundRobin => Box::new(RoundRobinScheduler::new(conf)),
+        MultipathAlgorithm::Weighted => Box::new(WeightedScheduler::new(conf)),
+        MultipathAlgorithm::Blest => Box::new(BlestScheduler::new(conf)),
     }
 }
 
@@ -115,6 +168,8 @@ pub(crate) fn buffer_required(algor: MultipathAlgorithm) -> bool {
         MultipathAlgorithm::MinRtt => false,
         MultipathAlgorithm::Redundant => true,
         MultipathAlgorithm::RoundRobin => false,
+        MultipathAlgorithm::Weighted => false,
+        MultipathAlgorithm::Blest => false,
     }
 }
 
@@ -196,6 +251,12 @@ pub(crate) mod tests {
             ("Roundrobin", Ok(MultipathAlgorithm::RoundRobin)),
             ("RoundRobin", Ok(MultipathAlgorithm::RoundRobin)),
             ("ROUNDROBIN", Ok(MultipathAlgorithm::RoundRobin)),
+            ("weighted", Ok(MultipathAlgorithm::Weighted)),
+            ("Weighted", Ok(MultipathAlgorithm::Weighted)),
+            ("WEIGHTED", Ok(MultipathAlgorithm::Weighted)),
+            ("blest", Ok(MultipathAlgorithm::Blest)),
+            ("Blest", Ok(MultipathAlgorithm::Blest)),
+            ("BLEST", Ok(MultipathAlgorithm::Blest)),
             ("redun", Err(Error::InvalidConfig("unknown".into()))),
         ];
 
@@ -203,8 +264,33 @@ pub(crate) mod tests {
             assert_eq!(MultipathAlgorithm::from_str(name), algor);
         }
     }
+
+    #[test]
+    fn bond_mode_name() {
+        let cases = [
+            ("aggregate", Ok(MultipathBondMode::Aggregate)),
+            ("Aggregate", Ok(MultipathBondMode::Aggregate)),
+            ("AGGREGATE", Ok(MultipathBondMode::Aggregate)),
+            ("failover", Ok(MultipathBondMode::Failover)),
+            ("Failover", Ok(MultipathBondMode::Failover)),
+            ("FAILOVER", Ok(MultipathBondMode::Failover)),
+            ("loadbalance", Ok(MultipathBondMode::LoadBalance)),
+            ("LoadBalance", Ok(MultipathBondMode::LoadBalance)),
+            ("LOADBALANCE", Ok(MultipathBondMode::LoadBalance)),
+            (
+                "unknown",
+                Err(Error::InvalidConfig("unknown bond mode".into())),
+            ),
+        ];
+
+        for (name, mode) in cases {
+            assert_eq!(MultipathBondMode::from_str(name), mode);
+        }
+    }
 }
 
+mod scheduler_blest;
 mod scheduler_minrtt;
 mod scheduler_redundant;
 mod scheduler_rr;
+mod scheduler_weighted;

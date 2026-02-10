@@ -1975,6 +1975,14 @@ impl CongestionController for Bbr3 {
             None => Some(self.pacing_rate),
         }
     }
+
+    fn set_max_datagram_size(&mut self, size: u64) {
+        self.config.max_datagram_size = size;
+    }
+
+    fn set_app_limited(&mut self, app_limited: bool) {
+        self.delivery_rate_estimator.set_app_limited(app_limited);
+    }
 }
 
 #[cfg(test)]

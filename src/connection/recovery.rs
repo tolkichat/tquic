@@ -268,7 +268,6 @@ impl Recovery {
         }
 
         // Update RTT estimation
-        // TODO: check ack_delay against amx_ack_delay
         if let Some(rtt) = rtt_sample {
             // When adjusting an RTT sample using peer-reported acknowledgment
             // delays, an endpoint:
@@ -280,6 +279,11 @@ impl Recovery {
             // max_ack_delay after the handshake is confirmed;
             // See RFC 9000 Section 5.3
             let ack_delay = Duration::from_micros(ack_delay);
+            let ack_delay = if handshake_status.completed {
+                cmp::min(ack_delay, self.max_ack_delay)
+            } else {
+                ack_delay
+            };
             if !rtt.is_zero() {
                 self.rtt.update(ack_delay, rtt);
             }
@@ -335,8 +339,23 @@ impl Recovery {
                 }
 
                 sent_pkt.time_acked = Some(now);
-                // TODO: detect spurious retransmissions and increase the
-                // packet or time reordering threshold
+
+                // Detect spurious retransmissions: if a packet was previously
+                // declared lost but is now acknowledged, it was a spurious loss.
+                // Per RFC 9002, increase the packet reordering threshold to reduce
+                // future spurious retransmissions.
+                if sent_pkt.time_lost.is_some() {
+                    // Packet was declared lost but is now acknowledged - spurious loss
+                    self.pkt_thresh = self.pkt_thresh.saturating_add(1);
+                    self.stat_spurious_loss_event(1);
+                    trace!(
+                        "now={:?} {} spurious retransmission detected for pkt={}, increasing pkt_thresh to {}",
+                        now,
+                        self.trace_id,
+                        sent_pkt.pkt_num,
+                        self.pkt_thresh
+                    );
+                }
 
                 // TODO: update rtt.
 
@@ -567,7 +586,12 @@ impl Recovery {
             return;
         }
 
-        // TODO: The server's timer is not set if nothing can be sent.
+        // The server's timer is not set if nothing can be sent.
+        // See RFC 9002 Section 6.2.1.
+        if handshake_status.is_server && handshake_status.at_amplification_limit {
+            self.loss_detection_timer = None;
+            return;
+        }
 
         if self.ack_eliciting_in_flight == 0 && handshake_status.peer_verified_address {
             // There is nothing to detect lost, so no timer is set.
@@ -841,7 +865,10 @@ impl Recovery {
             max_datagram_size = cmp::min(self.max_datagram_size, max_datagram_size);
         }
 
-        // TODO: notify CC and pacer
+        // Notify the congestion controller about the new max datagram size.
+        // The pacer receives the updated value via the mtu parameter in schedule().
+        self.congestion
+            .set_max_datagram_size(max_datagram_size as u64);
 
         self.max_datagram_size = max_datagram_size;
     }
@@ -915,6 +942,15 @@ impl Recovery {
     pub(crate) fn stat_lost_event(&mut self, lost_pkts: u64, lost_bytes: u64) {
         self.stats.lost_count = self.stats.lost_count.saturating_add(lost_pkts);
         self.stats.lost_bytes = self.stats.lost_bytes.saturating_add(lost_bytes);
+    }
+
+    /// Update statistics for spurious loss events (packets acknowledged after
+    /// being declared lost).
+    pub(crate) fn stat_spurious_loss_event(&mut self, spurious_count: u64) {
+        self.stats.spurious_loss_count = self
+            .stats
+            .spurious_loss_count
+            .saturating_add(spurious_count);
     }
 
     /// Update statistics for the congestion_window
@@ -1143,6 +1179,8 @@ mod tests {
             derived_handshake_keys: true,
             peer_verified_address: true,
             completed: false,
+            is_server: false,
+            at_amplification_limit: false,
         };
         let mut now = Instant::now();
 
@@ -1216,6 +1254,8 @@ mod tests {
             derived_handshake_keys: true,
             peer_verified_address: true,
             completed: false,
+            is_server: false,
+            at_amplification_limit: false,
         };
         let mut now = Instant::now();
 
@@ -1303,6 +1343,8 @@ mod tests {
             derived_handshake_keys: true,
             peer_verified_address: true,
             completed: false,
+            is_server: false,
+            at_amplification_limit: false,
         };
         let mut now = Instant::now();
 
@@ -1366,6 +1408,8 @@ mod tests {
             derived_handshake_keys: true,
             peer_verified_address: true,
             completed: false,
+            is_server: false,
+            at_amplification_limit: false,
         };
         let mut now = Instant::now();
 
@@ -1474,6 +1518,8 @@ mod tests {
             derived_handshake_keys: true,
             peer_verified_address: true,
             completed: false,
+            is_server: false,
+            at_amplification_limit: false,
         };
         let mut now = Instant::now();
 
@@ -1578,6 +1624,8 @@ mod tests {
             derived_handshake_keys: true,
             peer_verified_address: true,
             completed: false,
+            is_server: false,
+            at_amplification_limit: false,
         };
         let mut now = Instant::now();
         let cwnd_before_ack = recovery.congestion.congestion_window();

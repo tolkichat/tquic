@@ -369,17 +369,18 @@ impl TlsSession {
     }
 
     /// Select decryption key.
+    ///
+    /// Key phase handling works the same way in both single-path and multipath QUIC.
+    /// All paths share the same TLS keys and key phase.
     pub fn select_key(
         &mut self,
         confirmed: bool,
-        enable_multipath: bool,
         hdr: &PacketHeader,
         space: &PacketNumSpace,
     ) -> Result<(&Open, bool)> {
         if !confirmed
             || hdr.pkt_type != PacketType::OneRTT
             || self.current_key_phase == hdr.key_phase
-            || enable_multipath
         {
             trace!("{} select current key", self.data.trace_id);
             let key = self.get_keys(hdr.pkt_type.to_level()?);
@@ -425,7 +426,18 @@ impl TlsSession {
         Ok(())
     }
 
+    /// Reset key phase tracking state in a space.
+    /// This should be called on all data spaces when keys are updated in multipath mode.
+    pub fn reset_key_phase_tracking(space: &mut PacketNumSpace) {
+        space.first_pkt_num_recv = None;
+        space.first_pkt_num_sent = None;
+    }
+
     /// Try to update key after receiving a packet.
+    ///
+    /// Returns true if a key update was performed. In multipath mode, the caller
+    /// should then reset key phase tracking in all other data spaces by calling
+    /// `reset_key_phase_tracking` on each.
     pub fn try_update_key(
         &mut self,
         timers: &mut TimerTable,
@@ -434,10 +446,13 @@ impl TlsSession {
         hdr: &PacketHeader,
         now: Instant,
         max_pto: Option<Duration>,
-    ) -> Result<()> {
-        if attempt_key_update {
+    ) -> Result<bool> {
+        let key_updated = if attempt_key_update {
             self.update_key(space)?;
-        }
+            true
+        } else {
+            false
+        };
 
         if space.first_pkt_num_recv.is_none() && self.current_key_phase == hdr.key_phase {
             space.first_pkt_num_recv = Some(hdr.pkt_num);
@@ -453,19 +468,28 @@ impl TlsSession {
             }
         }
 
-        Ok(())
+        Ok(key_updated)
     }
 
-    /// If a key update is allowed to initiate.
-    fn key_update_allowed(&self, enable_multipath: bool, space: &PacketNumSpace) -> Result<bool> {
-        if enable_multipath {
-            // TODO: support key update in multipath scenario.
-            return Ok(false);
-        }
-
-        if let Some(first_pkt_num_sent) = space.first_pkt_num_sent {
-            if first_pkt_num_sent <= space.largest_acked_pkt {
-                return Ok(true);
+    /// Check if a key update is allowed to initiate.
+    ///
+    /// In multipath mode, pass all data spaces. A key update is allowed if ANY
+    /// data space has had a packet with the current key phase acknowledged.
+    /// Per RFC 9001 Section 6.1: "An endpoint MUST NOT initiate a subsequent
+    /// key update until it has received an acknowledgment for a packet that
+    /// was sent in the current key phase."
+    fn key_update_allowed<'a, I>(&self, spaces: I) -> Result<bool>
+    where
+        I: Iterator<Item = &'a PacketNumSpace>,
+    {
+        for space in spaces {
+            if !space.is_data {
+                continue;
+            }
+            if let Some(first_pkt_num_sent) = space.first_pkt_num_sent {
+                if first_pkt_num_sent <= space.largest_acked_pkt {
+                    return Ok(true);
+                }
             }
         }
 
@@ -473,16 +497,46 @@ impl TlsSession {
     }
 
     /// Initiate a key update.
-    pub fn initiate_key_update(
-        &mut self,
-        space: &mut PacketNumSpace,
-        enable_multipath: bool,
-    ) -> Result<()> {
-        if !self.key_update_allowed(enable_multipath, space)? {
+    ///
+    /// In multipath mode, pass all data spaces. The key update will be allowed
+    /// if any data space has had a packet with the current key phase acknowledged.
+    /// All provided data spaces will have their tracking state reset.
+    pub fn initiate_key_update<'a, I>(&mut self, spaces: I) -> Result<()>
+    where
+        I: Iterator<Item = &'a mut PacketNumSpace>,
+    {
+        // Collect data spaces to check and update
+        let mut data_spaces: Vec<&'a mut PacketNumSpace> = spaces.filter(|s| s.is_data).collect();
+
+        // Check if key update is allowed by examining all data spaces
+        let allowed = data_spaces.iter().any(|space| {
+            if let Some(first_pkt_num_sent) = space.first_pkt_num_sent {
+                first_pkt_num_sent <= space.largest_acked_pkt
+            } else {
+                false
+            }
+        });
+
+        if !allowed {
             return Err(Error::Done);
         }
 
-        self.update_key(space)
+        // Update key material
+        if self.next_key.is_none() {
+            self.next_key = Some(self.derive_keys()?);
+        }
+        self.current_key_phase = !self.current_key_phase;
+        self.prev_key = Some(mem::replace(
+            &mut self.data.key_collection[Level::OneRTT],
+            self.next_key.take().unwrap(),
+        ));
+
+        // Reset tracking in all data spaces
+        for space in data_spaces.iter_mut() {
+            Self::reset_key_phase_tracking(space);
+        }
+
+        Ok(())
     }
 
     /// Discard the previous key.
