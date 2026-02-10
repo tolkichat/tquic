@@ -28,8 +28,8 @@ pub(crate) struct PacketBuffer {
 
 impl PacketBuffer {
     pub(crate) fn new(cache_size: usize) -> Self {
-        let size = std::num::NonZeroUsize::new(cache_size)
-            .expect("zerortt_buffer_size must be non-zero");
+        let size =
+            std::num::NonZeroUsize::new(cache_size).expect("zerortt_buffer_size must be non-zero");
         Self {
             packets: lru::LruCache::new(size),
         }
@@ -50,10 +50,7 @@ impl PacketBuffer {
     }
 
     /// Remove all packets for the specified connection.
-    pub(crate) fn del(
-        &mut self,
-        dcid: &ConnectionId,
-    ) -> Option<Vec<(Vec<u8>, PacketInfo)>> {
+    pub(crate) fn del(&mut self, dcid: &ConnectionId) -> Option<Vec<(Vec<u8>, PacketInfo)>> {
         self.packets.pop(dcid)
     }
 }

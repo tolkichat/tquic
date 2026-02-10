@@ -22,8 +22,8 @@ use libc::size_t;
 
 use crate::error::Error;
 use crate::tls::TlsConfig;
-use crate::CongestionControlAlgorithm;
 use crate::Config;
+use crate::CongestionControlAlgorithm;
 use crate::MultipathAlgorithm;
 use crate::MultipathBondMode;
 

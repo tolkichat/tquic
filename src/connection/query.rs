@@ -583,7 +583,11 @@ impl Connection {
     }
 
     /// Set dcid provided by peer
-    pub(super) fn try_set_dcid_for_initial_path(&mut self, pid: usize, hdr: &PacketHeader) -> Result<()> {
+    pub(super) fn try_set_dcid_for_initial_path(
+        &mut self,
+        pid: usize,
+        hdr: &PacketHeader,
+    ) -> Result<()> {
         if self.flags.contains(GotPeerCid) {
             return Ok(());
         }

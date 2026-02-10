@@ -34,8 +34,8 @@ use super::sock_addr_to_c;
 use super::socklen_t;
 use super::Context;
 use super::LogWriter;
-use crate::FourTupleIter;
 use super::PathAddress;
+use crate::FourTupleIter;
 
 /// Get index of the connection
 #[no_mangle]

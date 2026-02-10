@@ -1911,14 +1911,8 @@ fn stream_frame_received_on_closed_stream(map: &mut StreamMap, stream_id: u64) {
 
     // Receive stream frame on the closed stream.
     assert!(
-        map.on_stream_frame_received(
-            stream_id,
-            0,
-            10,
-            false,
-            Bytes::from_static(b"Everything")
-        )
-        .is_ok(),
+        map.on_stream_frame_received(stream_id, 0, 10, false, Bytes::from_static(b"Everything"))
+            .is_ok(),
         "Stream is already closed, just ignore the frame."
     );
 }
@@ -2376,10 +2370,7 @@ fn stream_map_on_streams_blocked_frame_lost() {
     for bidi in &[true, false] {
         map.on_streams_blocked_frame_lost(*bidi, 1);
         assert_eq!(map.streams_blocked_at(*bidi), None);
-        map.on_streams_blocked_frame_lost(
-            *bidi,
-            map.concurrency_control.peer_max_streams(*bidi),
-        );
+        map.on_streams_blocked_frame_lost(*bidi, map.concurrency_control.peer_max_streams(*bidi));
         assert_eq!(
             map.streams_blocked_at(*bidi),
             Some(map.concurrency_control.peer_max_streams(*bidi))

@@ -249,9 +249,7 @@ impl Endpoint {
         }
 
         // Send the Stateless Reset packet for the unknown connection
-        if hdr.pkt_type == PacketType::OneRTT
-            && !hdr.dcid.is_empty()
-            && self.config.stateless_reset
+        if hdr.pkt_type == PacketType::OneRTT && !hdr.dcid.is_empty() && self.config.stateless_reset
         {
             self.send_stateless_reset(buf.len(), &hdr.dcid, local, remote)?;
             return Ok(());
@@ -850,11 +848,7 @@ impl Endpoint {
 
     /// Generate packets for a single sendable connection.
     /// Returns Ok(true) to continue, Ok(false) to break.
-    fn send_conn_packets(
-        &mut self,
-        idx: u64,
-        sent: &mut FxHashSet<u64>,
-    ) -> Result<bool> {
+    fn send_conn_packets(&mut self, idx: u64, sent: &mut FxHashSet<u64>) -> Result<bool> {
         if let Some(conn) = self.conns.get_mut(idx) {
             if conn.is_draining() || conn.is_closed() {
                 conn.mark_sendable(false);
