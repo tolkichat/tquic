@@ -3783,7 +3783,14 @@ impl Connection {
             None => return Ok(()),
         };
 
-        // TODO: check number of active path
+        // Don't allow abandoning the last active path
+        let path = self.paths.get(pid)?;
+        if path.active() {
+            let active_count = self.paths.iter().filter(|(_, p)| p.active()).count();
+            if active_count <= 1 {
+                return Err(Error::InvalidOperation("cannot abandon last active path".into()));
+            }
+        }
 
         // Mark the path as abandoned.
         let path = self.paths.get_mut(pid)?;
