@@ -1660,7 +1660,8 @@ impl Connection {
                 || path.need_send_ping
                 || self.cids.need_send_cid_control_frames()
                 || self.streams.need_send_stream_frames()
-                || self.spaces.need_send_buffered_frames())
+                || self.spaces.need_send_buffered_frames()
+                || !self.dgram_send_queue.is_empty())
         {
             if !self.is_server && self.tls_session.is_in_early_data() {
                 return Ok(PacketType::ZeroRTT);

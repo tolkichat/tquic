@@ -85,6 +85,9 @@ pub struct TquicConnection {
     /// Notified when the handshake completes.
     pub(crate) established: Arc<Notify>,
 
+    /// Notified when a DATAGRAM frame is received.
+    pub(crate) dgram_readable: Arc<Notify>,
+
     /// Watch channel receiving close information when connection ends.
     pub(crate) close_rx: watch::Receiver<Option<ConnectionCloseInfo>>,
 
@@ -149,7 +152,11 @@ impl TquicConnection {
     }
 
     /// Receive an unreliable datagram from the connection.
+    ///
+    /// Waits for the driver's `on_dgram_readable` notification before
+    /// attempting to read, avoiding busy polling.
     pub async fn read_datagram(&self) -> Result<Bytes, AsyncError> {
+        self.dgram_readable.notified().await;
         let (result_tx, result_rx) = oneshot::channel();
         self.cmd_tx
             .send(ConnCmd::RecvDatagram { result_tx })

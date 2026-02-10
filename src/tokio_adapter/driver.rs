@@ -29,6 +29,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -82,6 +83,9 @@ struct ConnectionState {
 
     /// Per-stream writable notifications.
     stream_writables: HashMap<u64, Arc<Notify>>,
+
+    /// Notified when a DATAGRAM frame arrives.
+    dgram_readable: Arc<Notify>,
 
     /// Sender for incoming bidirectional streams.
     incoming_bi_tx: mpsc::Sender<(SendStream, RecvStream)>,
@@ -161,6 +165,7 @@ impl DriverHandler {
     /// Create per-connection channels and state, returning the handle.
     fn register_connection(&mut self, index: u64, remote_addr: SocketAddr) -> TquicConnection {
         let established = Arc::new(Notify::new());
+        let dgram_readable = Arc::new(Notify::new());
         let (close_tx, close_rx) = watch::channel(None);
         let (conn_cmd_tx, conn_cmd_rx) = mpsc::channel(CONN_CMD_CAP);
         let (stream_cmd_tx, stream_cmd_rx) = mpsc::channel(STREAM_CMD_CAP);
@@ -174,6 +179,7 @@ impl DriverHandler {
             conn_cmd_rx,
             stream_readables: HashMap::new(),
             stream_writables: HashMap::new(),
+            dgram_readable: Arc::clone(&dgram_readable),
             incoming_bi_tx,
             incoming_uni_tx,
             stream_cmd_tx: stream_cmd_tx.clone(),
@@ -186,6 +192,7 @@ impl DriverHandler {
             cmd_tx: conn_cmd_tx,
             stream_cmd_tx,
             established,
+            dgram_readable,
             close_rx,
             incoming_bi_rx,
             incoming_uni_rx,
@@ -243,6 +250,10 @@ impl TransportHandler for HandlerShim {
         self.inner.borrow_mut().on_stream_closed(conn, stream_id);
     }
 
+    fn on_dgram_readable(&mut self, conn: &mut Connection) {
+        self.inner.borrow_mut().on_dgram_readable(conn);
+    }
+
     fn on_new_token(&mut self, conn: &mut Connection, token: Vec<u8>) {
         self.inner.borrow_mut().on_new_token(conn, token);
     }
@@ -280,8 +291,27 @@ impl TransportHandler for DriverHandler {
         }
     }
 
-    fn on_stream_created(&mut self, _conn: &mut Connection, _stream_id: u64) {
-        // Streams are created explicitly by the application; no-op.
+    fn on_stream_created(&mut self, conn: &mut Connection, stream_id: u64) {
+        let index = conn.index().unwrap_or(0);
+        // Determine if this is a peer-initiated stream by checking bit 0.
+        // Client-initiated streams have bit 0 = 0; server-initiated have bit 0 = 1.
+        let is_local = (stream_id & 0x1 == 0) != self.is_server;
+        if is_local {
+            // Locally-opened streams are handled by open_bi / open_uni.
+            return;
+        }
+        let is_bidi = stream_id & 0x2 == 0;
+        let Some(state) = self.conns.get_mut(&index) else {
+            return;
+        };
+        let tx = state.stream_cmd_tx.clone();
+        if is_bidi {
+            let (send, recv) = make_bidi_handles(index, stream_id, &tx, state);
+            let _ = state.incoming_bi_tx.try_send((send, recv));
+        } else {
+            let recv = make_recv_handle(index, stream_id, &tx, state);
+            let _ = state.incoming_uni_tx.try_send(recv);
+        }
     }
 
     fn on_stream_readable(&mut self, conn: &mut Connection, stream_id: u64) {
@@ -307,6 +337,13 @@ impl TransportHandler for DriverHandler {
         if let Some(state) = self.conns.get_mut(&index) {
             state.stream_readables.remove(&stream_id);
             state.stream_writables.remove(&stream_id);
+        }
+    }
+
+    fn on_dgram_readable(&mut self, conn: &mut Connection) {
+        let index = conn.index().unwrap_or(0);
+        if let Some(state) = self.conns.get(&index) {
+            state.dgram_readable.notify_one();
         }
     }
 
@@ -359,6 +396,7 @@ fn make_bidi_handles(
         conn_index,
         cmd_tx: stream_cmd_tx.clone(),
         writable,
+        finished: AtomicBool::new(false),
     };
     let recv = RecvStream {
         stream_id,
@@ -386,11 +424,11 @@ fn make_send_handle(
         conn_index,
         cmd_tx: stream_cmd_tx.clone(),
         writable,
+        finished: AtomicBool::new(false),
     }
 }
 
 /// Create a `RecvStream` handle for a peer-initiated unidirectional stream.
-#[allow(dead_code)]
 fn make_recv_handle(
     conn_index: u64,
     stream_id: u64,
@@ -659,7 +697,13 @@ async fn run_event_loop(
     let mut buf = vec![0u8; RECV_BUF_SIZE];
 
     loop {
-        let timeout_dur = endpoint.timeout().unwrap_or(DEFAULT_IDLE_TIMEOUT);
+        // Cap the sleep duration so that per-connection commands
+        // (which are drained after each select iteration) are not
+        // starved when the endpoint's next timer is far in the future.
+        let timeout_dur = endpoint
+            .timeout()
+            .map(|t| t.min(DEFAULT_IDLE_TIMEOUT))
+            .unwrap_or(DEFAULT_IDLE_TIMEOUT);
 
         tokio::select! {
             // Branch 1: Incoming UDP packet.

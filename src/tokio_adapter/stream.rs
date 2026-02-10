@@ -17,6 +17,7 @@
 //! [`SendStream`] and [`RecvStream`] provide async write and read
 //! halves of a QUIC stream, communicating with the driver via channels.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -51,6 +52,9 @@ pub struct SendStream {
     pub(crate) conn_index: u64,
     pub(crate) cmd_tx: mpsc::Sender<StreamCmd>,
     pub(crate) writable: Arc<Notify>,
+    /// Set to true after `finish()` is called to suppress the
+    /// `Shutdown::Write` on drop (which would send RESET_STREAM).
+    pub(crate) finished: AtomicBool,
 }
 
 impl SendStream {
@@ -77,6 +81,7 @@ impl SendStream {
     /// Signal that no more data will be written to this stream.
     pub async fn finish(&self) -> Result<(), AsyncError> {
         self.write_inner(&[], true).await?;
+        self.finished.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -102,10 +107,13 @@ impl SendStream {
 
 impl Drop for SendStream {
     fn drop(&mut self) {
-        let _ = self.cmd_tx.try_send(StreamCmd::Shutdown {
-            stream_id: self.stream_id,
-            direction: Shutdown::Write,
-        });
+        // Only send RESET_STREAM if finish() was never called.
+        if !self.finished.load(Ordering::Relaxed) {
+            let _ = self.cmd_tx.try_send(StreamCmd::Shutdown {
+                stream_id: self.stream_id,
+                direction: Shutdown::Write,
+            });
+        }
     }
 }
 
@@ -124,26 +132,45 @@ impl RecvStream {
     /// the stream has been fully received (FIN).
     pub async fn read(&self, buf: &mut [u8]) -> Result<Option<usize>, AsyncError> {
         self.readable.notified().await;
+        match self.read_inner(buf.len()).await {
+            Ok((data, fin)) => {
+                if data.is_empty() && fin {
+                    return Ok(None);
+                }
+                let n = data.len().min(buf.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                // If FIN arrived together with data, pre-notify so the
+                // next read() returns Ok(None) without blocking.
+                if fin {
+                    self.readable.notify_one();
+                }
+                Ok(Some(n))
+            }
+            // Done means no data available; after a FIN this signals
+            // the stream is fully consumed. StreamStateError can occur
+            // when reading after the stream has been fully received.
+            Err(AsyncError::Tquic(TquicError::Done))
+            | Err(AsyncError::Tquic(TquicError::StreamStateError)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Send a read command to the driver and return the raw result.
+    async fn read_inner(&self, buf_size: usize) -> Result<(Vec<u8>, bool), AsyncError> {
         let (result_tx, result_rx) = oneshot::channel();
         let cmd = StreamCmd::Read {
             stream_id: self.stream_id,
-            buf_size: buf.len(),
+            buf_size,
             result_tx,
         };
         self.cmd_tx
             .send(cmd)
             .await
             .map_err(|_| AsyncError::ChannelClosed)?;
-        let (data, fin) = result_rx
+        result_rx
             .await
             .map_err(|_| AsyncError::ChannelClosed)?
-            .map_err(AsyncError::Tquic)?;
-        if data.is_empty() && fin {
-            return Ok(None);
-        }
-        let n = data.len().min(buf.len());
-        buf[..n].copy_from_slice(&data[..n]);
-        Ok(Some(n))
+            .map_err(AsyncError::Tquic)
     }
 }
 
