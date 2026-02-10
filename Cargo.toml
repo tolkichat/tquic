@@ -41,6 +41,9 @@ qlog = ["dep:serde", "dep:serde_json", "dep:serde_derive", "dep:serde_with"]
 # enable support for h3
 h3 = ["dep:sfv"]
 
+# enable tokio async runtime adapter
+tokio-runtime = ["dep:tokio"]
+
 [dependencies]
 bytes = "1"
 rustc-hash = "1.1"
@@ -64,6 +67,7 @@ priority-queue = "1.3.2"
 sfv = { version = "0.9", optional=true }
 brotli = "8.0.1"
 flate2 = "1.1.2"
+tokio = { version = "1", features = ["net", "time", "sync", "macros", "rt"], optional = true }
 
 [target."cfg(windows)".dependencies]
 winapi = { version = "0.3", features = ["wincrypt", "ws2def", "ws2ipdef", "ws2tcpip"] }
