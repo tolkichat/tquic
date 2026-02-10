@@ -79,7 +79,10 @@ impl MultipathScheduler for WeightedScheduler {
         self.accumulated_weights.clear();
         self.total_weight = 0;
 
-        // Calculate weights for all active paths with available congestion window
+        // Calculate raw weights for all active paths with available congestion window
+        let mut raw_weights: Vec<(usize, u64)> = Vec::new();
+        let mut min_weight = u64::MAX;
+
         for (pid, path) in paths.iter_mut() {
             if !path.active() || !path.recovery.can_send() {
                 continue;
@@ -90,13 +93,21 @@ impl MultipathScheduler for WeightedScheduler {
             let weight = Self::calculate_weight(cwnd, srtt);
 
             if weight > 0 {
-                self.total_weight = self.total_weight.saturating_add(weight);
-                self.accumulated_weights.push((pid, self.total_weight));
+                min_weight = min_weight.min(weight);
+                raw_weights.push((pid, weight));
             }
         }
 
-        if self.accumulated_weights.is_empty() {
+        if raw_weights.is_empty() {
             return Err(Error::Done);
+        }
+
+        // Normalize weights relative to the smallest weight to keep counter manageable
+        let divisor = min_weight.max(1);
+        for (pid, weight) in &raw_weights {
+            let normalized = (*weight / divisor).max(1);
+            self.total_weight = self.total_weight.saturating_add(normalized);
+            self.accumulated_weights.push((*pid, self.total_weight));
         }
 
         // Use counter-based weighted selection for fair distribution
@@ -166,7 +177,7 @@ mod tests {
 
         // Verify that faster path (pid 1, 50ms RTT) is selected more than slower paths
         // Path 0: 200ms, Path 1: 50ms, Path 2: 200ms
-        // Path 1 should have roughly 4x the selections of paths 0 and 2
+        // Normalized weights: 1:4:1, so path 1 should get ~66% of selections
         assert!(path_counts[1] > path_counts[0]);
         assert!(path_counts[1] > path_counts[2]);
 
