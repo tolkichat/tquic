@@ -440,6 +440,44 @@ pub extern "C" fn quic_config_set_multipath_algorithm(config: &mut Config, v: Mu
     config.set_multipath_algorithm(v);
 }
 
+/// Set the multipath bonding mode.
+/// The default value is MultipathBondMode::Aggregate
+#[no_mangle]
+pub extern "C" fn quic_config_set_multipath_bond_mode(config: &mut Config, v: MultipathBondMode) {
+    config.set_multipath_bond_mode(v);
+}
+
+/// Set the BLEST scheduler lambda parameter.
+/// Higher values make the scheduler more aggressive in avoiding slow paths.
+/// The default value is 0.5
+#[no_mangle]
+pub extern "C" fn quic_config_set_blest_lambda(config: &mut Config, v: f64) {
+    config.set_blest_lambda(v);
+}
+
+/// Set the RTT threshold for failover mode in microseconds.
+/// When a path's RTT exceeds this, traffic may failover to backup.
+/// The default value is 0 (disabled).
+#[no_mangle]
+pub extern "C" fn quic_config_set_failover_rtt_threshold(config: &mut Config, us: u64) {
+    config.set_failover_rtt_threshold(us);
+}
+
+/// Set the path timeout in milliseconds.
+/// Paths are marked as failed after this timeout without response.
+/// The default value is 30000 (30 seconds).
+#[no_mangle]
+pub extern "C" fn quic_config_set_path_timeout(config: &mut Config, ms: u64) {
+    config.set_path_timeout(ms);
+}
+
+/// Set the path probe interval in milliseconds.
+/// The default value is 1000 (1 second).
+#[no_mangle]
+pub extern "C" fn quic_config_set_path_probe_interval(config: &mut Config, ms: u64) {
+    config.set_path_probe_interval(ms);
+}
+
 /// Set the maximum size of the connection flow control window.
 /// The default value is MAX_CONNECTION_WINDOW (15 MB).
 #[no_mangle]

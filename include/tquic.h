@@ -110,7 +110,41 @@ typedef enum quic_multipath_algorithm {
    * purposes.
    */
   QUIC_MULTIPATH_ALGORITHM_ROUND_ROBIN,
+  /**
+   * The scheduler distributes packets across paths proportionally to their
+   * estimated bandwidth capacity. Weight is calculated as cwnd/srtt.
+   * This approach aims to maximize aggregate throughput by utilizing each
+   * path according to its capacity.
+   */
+  QUIC_MULTIPATH_ALGORITHM_WEIGHTED,
+  /**
+   * BLocking ESTimation (BLEST) scheduler aims to minimize Head-of-Line
+   * blocking by estimating when a slower path might cause the receiver to
+   * stall. It prefers faster paths to avoid reordering delays.
+   */
+  QUIC_MULTIPATH_ALGORITHM_BLEST,
 } quic_multipath_algorithm;
+
+/**
+ * Multipath bonding modes that control how paths are used together.
+ */
+typedef enum quic_multipath_bond_mode {
+  /**
+   * Combine bandwidth from all available paths (default).
+   * Packets are distributed across paths according to the scheduler.
+   */
+  QUIC_MULTIPATH_BOND_MODE_AGGREGATE,
+  /**
+   * Use primary path with automatic failover to backup paths.
+   * Only switches to backup when primary becomes unavailable.
+   */
+  QUIC_MULTIPATH_BOND_MODE_FAILOVER,
+  /**
+   * Stream-based distribution across paths.
+   * Different streams may use different paths for load balancing.
+   */
+  QUIC_MULTIPATH_BOND_MODE_LOAD_BALANCE,
+} quic_multipath_bond_mode;
 
 /**
  * The stream's side to shutdown.
@@ -691,6 +725,40 @@ void quic_config_enable_multipath(struct quic_config_t *config, bool enabled);
  */
 void quic_config_set_multipath_algorithm(struct quic_config_t *config,
                                          enum quic_multipath_algorithm v);
+
+/**
+ * Set the multipath bonding mode.
+ * The default value is MultipathBondMode::Aggregate
+ */
+void quic_config_set_multipath_bond_mode(struct quic_config_t *config,
+                                         enum quic_multipath_bond_mode v);
+
+/**
+ * Set the BLEST scheduler lambda parameter.
+ * Higher values make the scheduler more aggressive in avoiding slow paths.
+ * The default value is 0.5
+ */
+void quic_config_set_blest_lambda(struct quic_config_t *config, double v);
+
+/**
+ * Set the RTT threshold for failover mode in microseconds.
+ * When a path's RTT exceeds this, traffic may failover to backup.
+ * The default value is 0 (disabled).
+ */
+void quic_config_set_failover_rtt_threshold(struct quic_config_t *config, uint64_t us);
+
+/**
+ * Set the path timeout in milliseconds.
+ * Paths are marked as failed after this timeout without response.
+ * The default value is 30000 (30 seconds).
+ */
+void quic_config_set_path_timeout(struct quic_config_t *config, uint64_t ms);
+
+/**
+ * Set the path probe interval in milliseconds.
+ * The default value is 1000 (1 second).
+ */
+void quic_config_set_path_probe_interval(struct quic_config_t *config, uint64_t ms);
 
 /**
  * Set the maximum size of the connection flow control window.

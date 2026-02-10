@@ -629,10 +629,43 @@ impl Config {
         self.local_transport_params.enable_multipath = v;
     }
 
-    /// Set the multipath scheduling algorithm
+    /// Set the multipath scheduling algorithm.
     /// The default value is MultipathAlgorithm::MinRtt
     pub fn set_multipath_algorithm(&mut self, v: MultipathAlgorithm) {
         self.multipath.multipath_algorithm = v;
+    }
+
+    /// Set the multipath bonding mode.
+    /// The default value is MultipathBondMode::Aggregate
+    pub fn set_multipath_bond_mode(&mut self, v: multipath_scheduler::MultipathBondMode) {
+        self.multipath.bond_mode = v;
+    }
+
+    /// Set the BLEST scheduler lambda parameter.
+    /// Higher values make the scheduler more aggressive in avoiding slow paths.
+    /// The default value is 0.5
+    pub fn set_blest_lambda(&mut self, v: f64) {
+        self.multipath.blest_lambda = v.max(0.0);
+    }
+
+    /// Set the RTT threshold for failover mode in microseconds.
+    /// When a path's RTT exceeds this, traffic may failover to backup.
+    /// The default value is 0 (disabled).
+    pub fn set_failover_rtt_threshold(&mut self, us: u64) {
+        self.multipath.failover_rtt_threshold_us = us;
+    }
+
+    /// Set the path timeout in milliseconds.
+    /// Paths are marked as failed after this timeout without response.
+    /// The default value is 30000 (30 seconds).
+    pub fn set_path_timeout(&mut self, ms: u64) {
+        self.multipath.path_timeout_ms = ms;
+    }
+
+    /// Set the path probe interval in milliseconds.
+    /// The default value is 1000 (1 second).
+    pub fn set_path_probe_interval(&mut self, ms: u64) {
+        self.multipath.path_probe_interval_ms = ms;
     }
 
     /// Set the maximum size of the connection flow control window.
@@ -892,13 +925,39 @@ impl Default for RecoveryConfig {
 #[derive(Debug, Clone)]
 pub struct MultipathConfig {
     /// Multipath scheduling algorithm.
-    multipath_algorithm: MultipathAlgorithm,
+    pub multipath_algorithm: MultipathAlgorithm,
+
+    /// Bonding mode controlling how paths are used together.
+    pub bond_mode: multipath_scheduler::MultipathBondMode,
+
+    /// Lambda parameter for BLEST scheduler blocking estimation.
+    /// Higher values make the scheduler more aggressive in avoiding slow paths.
+    /// Default is 0.5.
+    pub blest_lambda: f64,
+
+    /// RTT threshold in microseconds for failover mode.
+    /// When a path's RTT exceeds this threshold, traffic may failover to backup.
+    /// Default is 0 (disabled).
+    pub failover_rtt_threshold_us: u64,
+
+    /// Path timeout in milliseconds before marking a path as failed.
+    /// Default is 30000 (30 seconds).
+    pub path_timeout_ms: u64,
+
+    /// Interval in milliseconds between path probes.
+    /// Default is 1000 (1 second).
+    pub path_probe_interval_ms: u64,
 }
 
 impl Default for MultipathConfig {
     fn default() -> MultipathConfig {
         MultipathConfig {
             multipath_algorithm: MultipathAlgorithm::MinRtt,
+            bond_mode: multipath_scheduler::MultipathBondMode::Aggregate,
+            blest_lambda: 0.5,
+            failover_rtt_threshold_us: 0,
+            path_timeout_ms: 30000,
+            path_probe_interval_ms: 1000,
         }
     }
 }
@@ -1063,6 +1122,21 @@ pub enum PathEvent {
 
     /// The path has been abandoned.
     Abandoned(usize),
+
+    /// The path has failed (validation failed or timeout).
+    Failed(usize),
+
+    /// The path has been closed.
+    Closed(usize),
+
+    /// The path quality has degraded (RTT spike or high loss).
+    Degraded(usize),
+
+    /// The path quality has recovered.
+    Recovered(usize),
+
+    /// A new path has been added.
+    Added(usize),
 }
 
 /// Statistics about path
@@ -1144,6 +1218,13 @@ pub struct PathStats {
 
     /// Record the total number of times the PTO is triggered on this path
     pub pto_count: u64,
+
+    /// Number of packets received out of order (reordered).
+    pub reorder_count: u64,
+
+    /// Loss rate in per-mille (parts per thousand).
+    /// Calculated as (lost_count * 1000) / sent_count.
+    pub loss_rate_permille: u64,
 }
 
 #[cfg(test)]
@@ -1232,6 +1313,7 @@ pub use crate::connection::Connection;
 pub use crate::endpoint::Endpoint;
 pub use crate::error::Error;
 pub use crate::multipath_scheduler::MultipathAlgorithm;
+pub use crate::multipath_scheduler::MultipathBondMode;
 pub use crate::packet::PacketHeader;
 pub use crate::tls::CertCompressionAlgorithm;
 pub use crate::tls::TlsConfig;
