@@ -40,7 +40,7 @@ use crate::connection::Connection;
 use crate::{Config, Endpoint, PacketInfo, PacketSendHandler, SharedRc, TransportHandler};
 
 /// Maximum UDP receive buffer size (64 KiB).
-const RECV_BUF_SIZE: usize = 65536;
+pub(crate) const RECV_BUF_SIZE: usize = 65536;
 
 /// Maximum iterations per poll to avoid starving other tasks.
 const IO_LOOP_BOUND: usize = 10;
@@ -129,13 +129,29 @@ pub(crate) struct HandlerShared {
 /// Mutable endpoint-level state, behind a `Mutex`.
 pub(crate) struct EndpointState {
     /// The tquic endpoint (owns all connections).
-    pub(crate) endpoint: Endpoint,
+    ///
+    /// `None` only during the brief two-step init window; always
+    /// `Some` by the time any user or driver code runs.
+    pub(crate) endpoint: Option<Endpoint>,
 
     /// The waker for the [`EndpointDriver`] Future.
     pub(crate) driver_waker: Option<Waker>,
 
     /// Whether the endpoint has been shut down.
     pub(crate) closed: bool,
+}
+
+impl EndpointState {
+    /// Mutable access to the initialized endpoint.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called before the endpoint has been initialized.
+    pub(crate) fn endpoint(&mut self) -> &mut Endpoint {
+        self.endpoint
+            .as_mut()
+            .expect("endpoint not yet initialized")
+    }
 }
 
 /// Immutable shared parts of the endpoint.
@@ -299,12 +315,12 @@ impl TquicEndpoint {
             // connect() returns the connection index and fires
             // on_conn_created synchronously (while we hold the lock).
             let idx = state
-                .endpoint
+                .endpoint()
                 .connect(local, remote, Some(server_name), session, token, None)
                 .map_err(AsyncError::Tquic)?;
 
             // Drive the state machine to flush initial packets.
-            let _ = state.endpoint.process_connections();
+            let _ = state.endpoint().process_connections();
 
             (idx, extract_driver_waker(&state))
         };
@@ -629,8 +645,8 @@ impl Future for EndpointDriver {
 
         // Reset timer to the endpoint's next timeout.
         let dur = {
-            let state = driver.inner.state.lock().expect("endpoint lock");
-            state.endpoint.timeout().unwrap_or(DEFAULT_IDLE_TIMEOUT)
+            let mut state = driver.inner.state.lock().expect("endpoint lock");
+            state.endpoint().timeout().unwrap_or(DEFAULT_IDLE_TIMEOUT)
         };
         driver
             .timer
@@ -668,7 +684,7 @@ impl EndpointDriver {
                 return false;
             }
 
-            let _ = state.endpoint.process_connections();
+            let _ = state.endpoint().process_connections();
 
             if self.poll_expired_timeout(&mut state) {
                 work_done = true;
@@ -683,10 +699,10 @@ impl EndpointDriver {
     ///
     /// Returns `true` if a timeout fired and was processed.
     fn poll_expired_timeout(&self, state: &mut EndpointState) -> bool {
-        if let Some(timeout) = state.endpoint.timeout() {
+        if let Some(timeout) = state.endpoint().timeout() {
             if timeout.is_zero() {
-                state.endpoint.on_timeout(Instant::now());
-                let _ = state.endpoint.process_connections();
+                state.endpoint().on_timeout(Instant::now());
+                let _ = state.endpoint().process_connections();
                 return true;
             }
         }
@@ -711,7 +727,7 @@ impl EndpointDriver {
                         time: Instant::now(),
                     };
                     let mut state = self.inner.state.lock().expect("endpoint lock");
-                    let _ = state.endpoint.recv(&mut self.recv_buf[..n], &info);
+                    let _ = state.endpoint().recv(&mut self.recv_buf[..n], &info);
                     received = true;
                 }
                 // Spurious ICMP errors on UDP; ignore per QUIC spec.
@@ -758,19 +774,16 @@ async fn create_endpoint(
         pending_connects: Mutex::new(HashMap::new()),
     });
 
-    // Build EndpointInner with a placeholder endpoint (replaced below).
-    // We need the Arc<EndpointInner> for the handler, but the handler
-    // must be passed to Endpoint::new. Break the cycle with a two-step init.
+    // We need `Arc<EndpointInner>` for the handler, but the handler
+    // must be passed to `Endpoint::new`. Break the cycle by starting
+    // with `endpoint: None` and filling it in immediately after.
     let sender: SharedRc<dyn PacketSendHandler + Send + Sync> = SharedRc::new(UdpSender {
         socket: Arc::clone(&socket),
     });
 
-    // Create a temporary endpoint inner without the real endpoint.
-    // We'll swap it in after creating the Endpoint.
     let inner = Arc::new(EndpointInner {
         state: Mutex::new(EndpointState {
-            // Placeholder — immediately replaced below.
-            endpoint: create_placeholder_endpoint(&config, is_server, Arc::clone(&sender)),
+            endpoint: None, // filled in below
             driver_waker: None,
             closed: false,
         }),
@@ -781,7 +794,6 @@ async fn create_endpoint(
         },
     });
 
-    // Now create the real handler with the Arc<EndpointInner>.
     let handler = AdapterHandler {
         shared: Arc::clone(&handler_shared),
         endpoint_inner: Arc::clone(&inner),
@@ -789,11 +801,8 @@ async fn create_endpoint(
         is_server,
     };
 
-    // Create the real Endpoint with the handler.
     let endpoint = Endpoint::new(Box::new(config), is_server, Box::new(handler), sender);
-
-    // Swap in the real endpoint.
-    inner.state.lock().expect("endpoint lock").endpoint = endpoint;
+    inner.state.lock().expect("endpoint lock").endpoint = Some(endpoint);
 
     let closed = Arc::new(AtomicBool::new(false));
     let driver = EndpointDriver {
@@ -805,24 +814,6 @@ async fn create_endpoint(
     tokio::spawn(driver);
 
     Ok(TquicEndpoint { inner, incoming_rx })
-}
-
-/// Create a placeholder endpoint for the two-step initialization.
-///
-/// This is immediately replaced with the real endpoint that holds
-/// the proper [`AdapterHandler`].
-fn create_placeholder_endpoint(
-    config: &Config,
-    is_server: bool,
-    sender: SharedRc<dyn PacketSendHandler + Send + Sync>,
-) -> Endpoint {
-    // The NoopHandler is only used momentarily and never receives callbacks.
-    Endpoint::new(
-        Box::new(config.clone()),
-        is_server,
-        Box::new(NoopHandler),
-        sender,
-    )
 }
 
 /// Bind a non-blocking UDP socket.
@@ -838,24 +829,6 @@ fn bind_udp_socket(bind: SocketAddr) -> Result<std::net::UdpSocket, AsyncError> 
 /// Extract the driver waker for waking outside the lock.
 pub(crate) fn extract_driver_waker(state: &EndpointState) -> Option<Waker> {
     state.driver_waker.clone()
-}
-
-// ---------------------------------------------------------------------------
-// NoopHandler — placeholder TransportHandler
-// ---------------------------------------------------------------------------
-
-/// A do-nothing handler used only as a placeholder during init.
-struct NoopHandler;
-
-impl TransportHandler for NoopHandler {
-    fn on_conn_created(&mut self, _: &mut Connection) {}
-    fn on_conn_established(&mut self, _: &mut Connection) {}
-    fn on_conn_closed(&mut self, _: &mut Connection) {}
-    fn on_stream_created(&mut self, _: &mut Connection, _: u64) {}
-    fn on_stream_readable(&mut self, _: &mut Connection, _: u64) {}
-    fn on_stream_writable(&mut self, _: &mut Connection, _: u64) {}
-    fn on_stream_closed(&mut self, _: &mut Connection, _: u64) {}
-    fn on_new_token(&mut self, _: &mut Connection, _: Vec<u8>) {}
 }
 
 /// Copy the essential fields of `ConnectionStats` into an owned value.

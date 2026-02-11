@@ -20,15 +20,18 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use super::endpoint::{copy_connection_stats, extract_driver_waker, ConnectionInner};
+use super::endpoint::{
+    copy_connection_stats, extract_driver_waker, ConnectionInner, RECV_BUF_SIZE,
+};
 use super::error::AsyncError;
 use super::stream::{RecvStream, SendStream};
 use crate::connection::ConnectionStats;
-use crate::Shutdown;
+use crate::{PacketInfo, Shutdown};
 
 /// Information about why a connection was closed.
 #[derive(Clone, Debug)]
@@ -61,27 +64,98 @@ pub struct TquicConnection {
 impl TquicConnection {
     /// Wait for the QUIC handshake to complete.
     ///
+    /// Actively drives UDP I/O inline to avoid extra scheduling
+    /// hops through the background `EndpointDriver`, reducing
+    /// handshake latency by several milliseconds.
+    ///
     /// Returns `Ok(())` when the handshake succeeds, or
     /// `Err(AsyncError::ConnectionClosed)` if the connection closes
     /// before the handshake finishes (e.g. TLS failure).
     pub async fn established(&self) -> Result<(), AsyncError> {
+        let mut recv_buf = vec![0u8; RECV_BUF_SIZE];
+        let local_addr = self.inner.endpoint.shared.local_addr;
+
         loop {
             // Create notified futures BEFORE checking state to avoid race.
             let est_notified = self.inner.established_notify.notified();
             let close_notified = self.inner.close_notify.notified();
-            {
-                let state = self.inner.conn_state.lock().expect("conn_state lock");
-                if state.is_established {
-                    return Ok(());
-                }
-                if state.close_info.is_some() {
-                    return Err(AsyncError::ConnectionClosed);
-                }
+
+            if self.check_established()? {
+                return Ok(());
             }
+
+            // Try inline I/O: non-blocking recv + process.
+            if self.try_drive_io(&mut recv_buf, local_addr) {
+                continue;
+            }
+
+            // No packets available -- wait for socket or notify.
             tokio::select! {
                 _ = est_notified => {},
                 _ = close_notified => {},
+                _ = self.inner.endpoint.shared.socket.readable() => {},
             }
+        }
+    }
+
+    /// Check whether the handshake has completed or the connection
+    /// has been closed.
+    ///
+    /// Returns `Ok(true)` if established, `Err` if closed.
+    fn check_established(&self) -> Result<bool, AsyncError> {
+        let cs = self.inner.conn_state.lock().expect("conn_state lock");
+        if cs.is_established {
+            return Ok(true);
+        }
+        if cs.close_info.is_some() {
+            return Err(AsyncError::ConnectionClosed);
+        }
+        Ok(false)
+    }
+
+    /// Non-blocking receive-and-process loop.
+    ///
+    /// Reads packets from the shared socket and feeds them into the
+    /// endpoint state machine. Returns `true` if at least one packet
+    /// was processed (caller should re-check state immediately).
+    fn try_drive_io(&self, recv_buf: &mut [u8], local_addr: SocketAddr) -> bool {
+        let mut processed = false;
+        loop {
+            match self.inner.endpoint.shared.socket.try_recv_from(recv_buf) {
+                Ok((n, src)) => {
+                    let info = PacketInfo {
+                        src,
+                        dst: local_addr,
+                        time: Instant::now(),
+                    };
+                    self.feed_packet(&recv_buf[..n], &info);
+                    processed = true;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::ConnectionReset
+                        || e.kind() == std::io::ErrorKind::ConnectionRefused =>
+                {
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
+        processed
+    }
+
+    /// Feed a single received packet into the endpoint and wake the
+    /// driver so it can send any response packets.
+    fn feed_packet(&self, data: &[u8], info: &PacketInfo) {
+        let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
+        // recv() takes &mut [u8] for in-place decryption.
+        let mut buf = data.to_vec();
+        let _ = state.endpoint().recv(&mut buf, info);
+        let _ = state.endpoint().process_connections();
+        let waker = extract_driver_waker(&state);
+        drop(state);
+        if let Some(w) = waker {
+            w.wake();
         }
     }
 
@@ -90,7 +164,7 @@ impl TquicConnection {
         let (stream_id, waker) = {
             let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
             let conn = state
-                .endpoint
+                .endpoint()
                 .conn_get_mut(self.inner.index)
                 .ok_or(AsyncError::ConnectionClosed)?;
             let sid = conn.stream_bidi_new(0, false).map_err(AsyncError::Tquic)?;
@@ -112,7 +186,7 @@ impl TquicConnection {
         let (stream_id, waker) = {
             let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
             let conn = state
-                .endpoint
+                .endpoint()
                 .conn_get_mut(self.inner.index)
                 .ok_or(AsyncError::ConnectionClosed)?;
             let sid = conn.stream_uni_new(0, false).map_err(AsyncError::Tquic)?;
@@ -150,7 +224,7 @@ impl TquicConnection {
         let waker = {
             let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
             let conn = state
-                .endpoint
+                .endpoint()
                 .conn_get_mut(self.inner.index)
                 .ok_or(AsyncError::ConnectionClosed)?;
             conn.dgram_send(data).map_err(AsyncError::Tquic)?;
@@ -172,7 +246,7 @@ impl TquicConnection {
             let notified = self.inner.dgram_notify.notified();
             {
                 let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
-                if let Some(conn) = state.endpoint.conn_get_mut(self.inner.index) {
+                if let Some(conn) = state.endpoint().conn_get_mut(self.inner.index) {
                     match conn.dgram_recv() {
                         Ok(data) => return Ok(data),
                         Err(crate::Error::Done) => {} // No data yet.
@@ -191,7 +265,7 @@ impl TquicConnection {
     pub fn close(&self, error_code: u64, reason: &[u8]) {
         let waker = {
             let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
-            if let Some(conn) = state.endpoint.conn_get_mut(self.inner.index) {
+            if let Some(conn) = state.endpoint().conn_get_mut(self.inner.index) {
                 let _ = conn.close(true, error_code, reason);
             }
             extract_driver_waker(&state)
@@ -206,7 +280,7 @@ impl TquicConnection {
     pub async fn stats(&self) -> Result<ConnectionStats, AsyncError> {
         let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
         let conn = state
-            .endpoint
+            .endpoint()
             .conn_get_mut(self.inner.index)
             .ok_or(AsyncError::ConnectionClosed)?;
         Ok(copy_connection_stats(conn))

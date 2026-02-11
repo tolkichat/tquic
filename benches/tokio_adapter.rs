@@ -79,9 +79,8 @@ fn localhost_any() -> SocketAddr {
 // Connection setup helpers
 // ---------------------------------------------------------------------------
 
-/// Start a server endpoint and return it with its bound address.
-async fn start_server() -> (TquicEndpoint, SocketAddr) {
-    let config = make_config(true);
+/// Start a server endpoint from a pre-built config.
+async fn start_server(config: Config) -> (TquicEndpoint, SocketAddr) {
     let endpoint = TquicEndpoint::server(localhost_any(), config)
         .await
         .expect("server endpoint creation");
@@ -89,9 +88,8 @@ async fn start_server() -> (TquicEndpoint, SocketAddr) {
     (endpoint, addr)
 }
 
-/// Start a client endpoint bound to a random port.
-async fn start_client() -> TquicEndpoint {
-    let config = make_config(false);
+/// Start a client endpoint from a pre-built config.
+async fn start_client(config: Config) -> TquicEndpoint {
     TquicEndpoint::client(localhost_any(), config)
         .await
         .expect("client endpoint creation")
@@ -113,8 +111,7 @@ async fn establish_pair(
 
 /// Wait for both sides of the handshake to complete.
 async fn wait_for_handshake(client: &TquicConnection, server: &TquicConnection) {
-    tokio::try_join!(client.established(), server.established())
-        .expect("handshake failed");
+    tokio::try_join!(client.established(), server.established()).expect("handshake failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -185,14 +182,19 @@ fn bench_runtime() -> tokio::runtime::Runtime {
 // ---------------------------------------------------------------------------
 
 /// Measure the time to establish a QUIC connection (connect + handshake).
+///
+/// TLS configs are pre-built outside the iteration loop so that
+/// BoringSSL certificate loading (~18 ms) is not measured.
 fn bench_handshake(c: &mut Criterion) {
     let rt = bench_runtime();
+    let server_config = make_config(true);
+    let client_config = make_config(false);
 
     c.bench_function("handshake", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let (mut server, server_addr) = start_server().await;
-                let client = start_client().await;
+                let (mut server, server_addr) = start_server(server_config.clone()).await;
+                let client = start_client(client_config.clone()).await;
                 let (client_conn, _server_conn) =
                     establish_pair(&mut server, &client, server_addr).await;
                 std::hint::black_box(&client_conn);
@@ -207,20 +209,26 @@ fn bench_handshake(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 /// Measure bidirectional stream throughput at various payload sizes.
+///
+/// TLS configs are pre-built outside the iteration loop.
 fn bench_stream_throughput(c: &mut Criterion) {
     let rt = bench_runtime();
+    let server_config = make_config(true);
+    let client_config = make_config(false);
     let mut group = c.benchmark_group("stream_throughput");
     group.sampling_mode(SamplingMode::Flat);
 
     for &size in &[1024, 64 * 1024, 1024 * 1024] {
         group.throughput(Throughput::Bytes(size as u64));
+        let sc = server_config.clone();
+        let cc = client_config.clone();
         group.bench_with_input(
             BenchmarkId::from_parameter(format_size(size)),
             &size,
             |b, &payload_size| {
                 b.iter(|| {
                     rt.block_on(async {
-                        run_stream_throughput_iter(payload_size).await;
+                        run_stream_throughput_iter(sc.clone(), cc.clone(), payload_size).await;
                     });
                 });
             },
@@ -243,9 +251,13 @@ fn format_size(bytes: usize) -> String {
 ///
 /// Creates a connection pair, spawns an echo server,
 /// writes `payload_size` bytes and reads the echo back.
-async fn run_stream_throughput_iter(payload_size: usize) {
-    let (mut server, server_addr) = start_server().await;
-    let client = start_client().await;
+async fn run_stream_throughput_iter(
+    server_config: Config,
+    client_config: Config,
+    payload_size: usize,
+) {
+    let (mut server, server_addr) = start_server(server_config).await;
+    let client = start_client(client_config).await;
     let (client_conn, server_conn) = establish_pair(&mut server, &client, server_addr).await;
 
     let echo_task = tokio::spawn(echo_one_stream(server_conn));
@@ -267,20 +279,27 @@ async fn run_stream_throughput_iter(payload_size: usize) {
 // ---------------------------------------------------------------------------
 
 /// Measure datagram send throughput at various batch sizes.
+///
+/// TLS configs are pre-built outside the iteration loop.
 fn bench_datagram_throughput(c: &mut Criterion) {
     let rt = bench_runtime();
+    let server_config = make_config(true);
+    let client_config = make_config(false);
     let mut group = c.benchmark_group("datagram_throughput");
     group.sampling_mode(SamplingMode::Flat);
 
     for &count in &[10u64, 100, 1000] {
         group.throughput(Throughput::Elements(count));
+        let sc = server_config.clone();
+        let cc = client_config.clone();
         group.bench_with_input(
             BenchmarkId::from_parameter(count),
             &count,
             |b, &dgram_count| {
                 b.iter(|| {
                     rt.block_on(async {
-                        run_datagram_throughput_iter(dgram_count as usize).await;
+                        run_datagram_throughput_iter(sc.clone(), cc.clone(), dgram_count as usize)
+                            .await;
                     });
                 });
             },
@@ -295,9 +314,9 @@ fn bench_datagram_throughput(c: &mut Criterion) {
 /// Creates a connection pair, sends `count` datagrams from client,
 /// and drains them on the server side. The drain is best-effort
 /// since QUIC datagrams are unreliable.
-async fn run_datagram_throughput_iter(count: usize) {
-    let (mut server, server_addr) = start_server().await;
-    let client = start_client().await;
+async fn run_datagram_throughput_iter(server_config: Config, client_config: Config, count: usize) {
+    let (mut server, server_addr) = start_server(server_config).await;
+    let client = start_client(client_config).await;
     let (client_conn, server_conn) = establish_pair(&mut server, &client, server_addr).await;
 
     let drain_task = tokio::spawn(async move { drain_datagrams(&server_conn, count).await });

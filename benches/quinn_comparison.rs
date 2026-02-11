@@ -101,19 +101,18 @@ fn localhost_any() -> SocketAddr {
 // Connection setup helpers
 // ---------------------------------------------------------------------------
 
-/// Start a Quinn server endpoint and return it with its bound address.
-fn start_server(cert: &BenchCert) -> (Endpoint, SocketAddr) {
-    let server_config = make_server_config(cert);
+/// Start a Quinn server endpoint from a pre-built config.
+fn start_server(config: ServerConfig) -> (Endpoint, SocketAddr) {
     let endpoint =
-        Endpoint::server(server_config, localhost_any()).expect("quinn server endpoint creation");
+        Endpoint::server(config, localhost_any()).expect("quinn server endpoint creation");
     let addr = endpoint.local_addr().expect("server local addr");
     (endpoint, addr)
 }
 
-/// Start a Quinn client endpoint.
-fn start_client(cert: &BenchCert) -> Endpoint {
+/// Start a Quinn client endpoint from a pre-built config.
+fn start_client(config: ClientConfig) -> Endpoint {
     let mut endpoint = Endpoint::client(localhost_any()).expect("quinn client endpoint creation");
-    endpoint.set_default_client_config(make_client_config(cert));
+    endpoint.set_default_client_config(config);
     endpoint
 }
 
@@ -213,15 +212,20 @@ fn bench_runtime() -> tokio::runtime::Runtime {
 // ---------------------------------------------------------------------------
 
 /// Measure the time to establish a QUIC connection (connect + handshake).
+///
+/// TLS configs are pre-built outside the iteration loop so that
+/// certificate generation cost is not measured.
 fn bench_quinn_handshake(c: &mut Criterion) {
     let rt = bench_runtime();
     let cert = generate_bench_cert();
+    let server_config = make_server_config(&cert);
+    let client_config = make_client_config(&cert);
 
     c.bench_function("quinn_handshake", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let (server, server_addr) = start_server(&cert);
-                let client = start_client(&cert);
+                let (server, server_addr) = start_server(server_config.clone());
+                let client = start_client(client_config.clone());
                 let (client_conn, _server_conn) =
                     establish_pair(&server, &client, server_addr).await;
                 std::hint::black_box(&client_conn);
@@ -236,20 +240,26 @@ fn bench_quinn_handshake(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 /// Measure bidirectional stream throughput at various payload sizes.
+///
+/// TLS configs are pre-built outside the iteration loop.
 fn bench_quinn_stream_throughput(c: &mut Criterion) {
     let rt = bench_runtime();
     let cert = generate_bench_cert();
+    let server_config = make_server_config(&cert);
+    let client_config = make_client_config(&cert);
     let mut group = c.benchmark_group("quinn_stream_throughput");
     group.sampling_mode(SamplingMode::Flat);
 
     for &size in &[1024, 64 * 1024, 1024 * 1024] {
         group.throughput(Throughput::Bytes(size as u64));
+        let sc = server_config.clone();
+        let cc = client_config.clone();
         group.bench_with_input(
             BenchmarkId::from_parameter(format_size(size)),
             &size,
             |b, &payload_size| {
                 b.iter(|| {
-                    rt.block_on(run_stream_iter(&cert, payload_size));
+                    rt.block_on(run_stream_iter(sc.clone(), cc.clone(), payload_size));
                 });
             },
         );
@@ -271,9 +281,13 @@ fn format_size(bytes: usize) -> String {
 ///
 /// Creates a connection pair, spawns an echo server,
 /// writes `payload_size` bytes and reads the echo back.
-async fn run_stream_iter(cert: &BenchCert, payload_size: usize) {
-    let (server, server_addr) = start_server(cert);
-    let client = start_client(cert);
+async fn run_stream_iter(
+    server_config: ServerConfig,
+    client_config: ClientConfig,
+    payload_size: usize,
+) {
+    let (server, server_addr) = start_server(server_config);
+    let client = start_client(client_config);
     let (client_conn, server_conn) = establish_pair(&server, &client, server_addr).await;
 
     let echo_task = tokio::spawn(echo_one_stream(server_conn));
@@ -295,20 +309,30 @@ async fn run_stream_iter(cert: &BenchCert, payload_size: usize) {
 // ---------------------------------------------------------------------------
 
 /// Measure datagram send throughput at various batch sizes.
+///
+/// TLS configs are pre-built outside the iteration loop.
 fn bench_quinn_datagram_throughput(c: &mut Criterion) {
     let rt = bench_runtime();
     let cert = generate_bench_cert();
+    let server_config = make_server_config(&cert);
+    let client_config = make_client_config(&cert);
     let mut group = c.benchmark_group("quinn_datagram_throughput");
     group.sampling_mode(SamplingMode::Flat);
 
     for &count in &[10u64, 100, 1000] {
         group.throughput(Throughput::Elements(count));
+        let sc = server_config.clone();
+        let cc = client_config.clone();
         group.bench_with_input(
             BenchmarkId::from_parameter(count),
             &count,
             |b, &dgram_count| {
                 b.iter(|| {
-                    rt.block_on(run_datagram_iter(&cert, dgram_count as usize));
+                    rt.block_on(run_datagram_iter(
+                        sc.clone(),
+                        cc.clone(),
+                        dgram_count as usize,
+                    ));
                 });
             },
         );
@@ -322,9 +346,9 @@ fn bench_quinn_datagram_throughput(c: &mut Criterion) {
 /// Creates a connection pair, sends `count` datagrams from client,
 /// and drains them on the server side. The drain is best-effort
 /// since QUIC datagrams are unreliable.
-async fn run_datagram_iter(cert: &BenchCert, count: usize) {
-    let (server, server_addr) = start_server(cert);
-    let client = start_client(cert);
+async fn run_datagram_iter(server_config: ServerConfig, client_config: ClientConfig, count: usize) {
+    let (server, server_addr) = start_server(server_config);
+    let client = start_client(client_config);
     let (client_conn, server_conn) = establish_pair(&server, &client, server_addr).await;
 
     let drain_task = tokio::spawn(async move { drain_datagrams(&server_conn, count).await });

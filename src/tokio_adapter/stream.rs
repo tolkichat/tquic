@@ -77,7 +77,7 @@ impl SendStream {
             }
 
             let mut state = conn_inner.endpoint.state.lock().expect("endpoint lock");
-            let conn = match state.endpoint.conn_get_mut(conn_index) {
+            let conn = match state.endpoint().conn_get_mut(conn_index) {
                 Some(c) => c,
                 None => return Poll::Ready(Err(AsyncError::ConnectionClosed)),
             };
@@ -127,7 +127,7 @@ impl SendStream {
                 .lock()
                 .expect("endpoint lock");
             let conn = state
-                .endpoint
+                .endpoint()
                 .conn_get_mut(self.conn_index)
                 .ok_or(AsyncError::ConnectionClosed)?;
 
@@ -153,7 +153,7 @@ impl Drop for SendStream {
         // Only send RESET_STREAM if finish() was never called.
         if !self.finished.load(Ordering::Relaxed) {
             if let Ok(mut state) = self.conn_inner.endpoint.state.lock() {
-                if let Some(conn) = state.endpoint.conn_get_mut(self.conn_index) {
+                if let Some(conn) = state.endpoint().conn_get_mut(self.conn_index) {
                     let _ = conn.stream_shutdown(self.stream_id, Shutdown::Write, 0);
                 }
             }
@@ -204,7 +204,7 @@ impl RecvStream {
             }
 
             let mut state = conn_inner.endpoint.state.lock().expect("endpoint lock");
-            let conn = match state.endpoint.conn_get_mut(conn_index) {
+            let conn = match state.endpoint().conn_get_mut(conn_index) {
                 Some(c) => c,
                 None => return Poll::Ready(Ok(None)),
             };
@@ -240,7 +240,7 @@ impl RecvStream {
 impl Drop for RecvStream {
     fn drop(&mut self) {
         if let Ok(mut state) = self.conn_inner.endpoint.state.lock() {
-            if let Some(conn) = state.endpoint.conn_get_mut(self.conn_index) {
+            if let Some(conn) = state.endpoint().conn_get_mut(self.conn_index) {
                 let _ = conn.stream_shutdown(self.stream_id, Shutdown::Read, 0);
             }
         }
