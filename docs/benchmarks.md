@@ -1,220 +1,271 @@
-# QUIC Performance Benchmarks & Research
+# Бенчмарки производительности QUIC
 
-**Goal:** Build the fastest, most reliable QUIC transport library in Rust.
+**Цель:** Создать самую быструю и надёжную QUIC-библиотеку на Rust.
 
-**Method:** Systematic benchmarking against all major Rust QUIC implementations,
-finding performance gaps, understanding root causes, and adopting best patterns.
-
----
-
-## Implementations Under Test
-
-| # | Library | Version | Org | TLS Backend | Async Model |
-|---|---------|---------|-----|-------------|-------------|
-| 1 | **tquic (our fork)** | develop | tolkichat | BoringSSL | Arc<Mutex> + EndpointDriver Future |
-| 2 | **Quinn** | 0.11.x | quinn-rs | rustls | Arc<Mutex> + EndpointDriver Future |
-| 3 | **tquic (original)** | 0.21.x | Tencent | BoringSSL | Rc<RefCell> + mio event loop |
-| 4 | **quiche** | 0.22.x | Cloudflare | BoringSSL | C core + Rust FFI, poll-based |
-| 5 | **s2n-quic** | 1.x | AWS | s2n-tls/rustls | tokio native, io-uring optional |
-| 6 | **neqo** | 0.10.x | Mozilla | NSS | sync poll-based, no async runtime |
+**Метод:** Систематическое сравнение со всеми основными Rust-реализациями QUIC,
+поиск узких мест, анализ причин и заимствование лучших решений.
 
 ---
 
-## Benchmark Categories
+## Тестируемые реализации
 
-### 1. Handshake Latency
-- Time from `connect()` to `established()`
-- 1-RTT and 0-RTT variants
-- Metrics: mean, P50, P95, P99
-- Isolate TLS from QUIC overhead
+| # | Библиотека | Версия | Crate | TLS | Async-модель | Известная скорость |
+|---|-----------|--------|-------|-----|-------------|-------------------|
+| 1 | **tquic (наш форк)** | develop | local | BoringSSL | Arc<Mutex> + EndpointDriver Future | Не тестирована |
+| 2 | **Quinn** | 0.12.0 | `quinn` | rustls (ring/aws-lc-rs) | Arc<Mutex> + lock tracking | 8.22 Gbps |
+| 3 | **tquic (оригинал)** | 1.6.0 | `tquic` | BoringSSL | Rc<RefCell> + mio event loop | 4-5x быстрее quiche |
+| 4 | **tokio-quiche** | 0.14.2 | `tokio-quiche` | BoringSSL (boring) | Акторная модель + каналы | млн req/s |
+| 5 | **s2n-quic** | 1.74.0 | `s2n-quic` | s2n-tls/rustls | tokio native, GSO обязателен | Не опубликована |
+| 6 | **neqo** | 0.22.2 | `neqo-transport` | NSS | sync poll-based, Rc<RefCell> | Не тестирована |
 
-### 2. Stream Throughput
-- Unidirectional + bidirectional
-- Payload sizes: 1 KB, 64 KB, 1 MB, 10 MB
-- Single stream and concurrent (1, 10, 100 streams)
-- Metrics: MB/s, CPU utilization per MB
+### Совместимость зависимостей
 
-### 3. Datagram Throughput
-- Unreliable DATAGRAM frames (RFC 9221)
-- Packet sizes: 64 B, 512 B, 1200 B (MTU)
-- Metrics: packets/sec, bytes/sec, loss rate
+| Библиотека | Как dev-dep в tquic? | Проблема |
+|-----------|---------------------|----------|
+| Quinn | **Можно** | Нет конфликтов (rustls отдельно от BoringSSL) |
+| s2n-quic | **Можно** | Нет конфликтов (s2n-tls/rustls) |
+| tokio-quiche | **Нельзя** | Оба (quiche + tquic) собирают свой BoringSSL → duplicate symbols |
+| neqo | **Нельзя** | Не на crates.io + требует NSS (`libnss3-dev`) |
+| tquic оригинал | **Нельзя** | Тот же BoringSSL конфликт + конфликт имён пакета |
 
-### 4. Connection Scalability
-- Concurrent connections: 10, 100, 500, 1000
-- Memory per connection
-- Degradation curve (throughput vs connection count)
-
-### 5. Lock Contention & CPU
-- Mutex acquisition cost under load
-- CPU profile (perf/flamegraph)
-- Context switches per operation
-
-### 6. Latency Under Load
-- Stream write-to-read latency with background traffic
-- Tail latency (P99, P99.9)
-- Jitter measurement
-
-### 7. Resilience
-- Behavior under packet loss (0%, 1%, 5%, 10%)
-- Recovery time after network interruption
-- Connection migration (if supported)
+**Решение для конфликтных:** Отдельный crate `quic-bench` с взаимоисключающими features.
+Запуск: `cargo bench --features bench-quiche` — только одна BoringSSL-библиотека за раз.
 
 ---
 
-## Results
+## Категории бенчмарков
 
-### Round 1: Baseline (TBD)
+### 1. Задержка хендшейка
+- Время от `connect()` до `established()`
+- Варианты: 1-RTT и 0-RTT
+- Метрики: среднее, P50, P95, P99
+- Отделить TLS от QUIC overhead
 
-> First benchmark run on localhost, no artificial loss/delay.
-> All implementations use self-signed certs, QUIC v1, default configs.
+### 2. Пропускная способность потоков (streams)
+- Однонаправленные + двунаправленные
+- Размеры payload: 1 KB, 64 KB, 1 MB, 10 MB
+- Один поток и конкурентные (1, 10, 100 потоков)
+- Метрики: MB/s, загрузка CPU на MB
 
-#### Handshake Latency (localhost, 1-RTT)
+### 3. Пропускная способность датаграмм
+- Ненадёжные DATAGRAM-фреймы (RFC 9221)
+- Размеры пакетов: 64 B, 512 B, 1200 B (MTU)
+- Метрики: пакетов/сек, байт/сек, процент потерь
 
-| Library | Mean | P50 | P95 | P99 | Notes |
-|---------|------|-----|-----|-----|-------|
-| tquic (ours) | - | - | - | - | |
+### 4. Масштабируемость соединений
+- Конкурентные соединения: 10, 100, 500, 1000
+- Память на соединение
+- Кривая деградации (throughput vs кол-во соединений)
+
+### 5. Конкуренция за блокировки (lock contention) и CPU
+- Стоимость захвата мьютекса под нагрузкой
+- CPU-профиль (perf/flamegraph)
+- Переключения контекста на операцию
+
+### 6. Задержка под нагрузкой
+- Задержка stream write→read с фоновым трафиком
+- Хвостовая задержка (P99, P99.9)
+- Измерение джиттера
+
+### 7. Устойчивость
+- Поведение при потере пакетов (0%, 1%, 5%, 10%)
+- Время восстановления после сетевого разрыва
+- Миграция соединений (если поддерживается)
+
+---
+
+## Результаты
+
+### Раунд 1: Базовая линия (TBD)
+
+> Первый прогон на localhost, без искусственных потерь/задержек.
+> Все реализации используют self-signed сертификаты, QUIC v1, дефолтные конфиги.
+
+#### Задержка хендшейка (localhost, 1-RTT)
+
+| Библиотека | Среднее | P50 | P95 | P99 | Заметки |
+|-----------|---------|-----|-----|-----|---------|
+| tquic (наш) | ~230ms | - | - | - | Включает 200ms delay constant |
 | Quinn | - | - | - | - | |
-| tquic (orig) | - | - | - | - | |
+| tquic (ориг) | - | - | - | - | |
 | quiche | - | - | - | - | |
 | s2n-quic | - | - | - | - | |
 | neqo | - | - | - | - | |
 
-#### Stream Throughput (single stream, 1 MB payload)
+#### Пропускная способность потоков (один поток, 1 MB payload)
 
-| Library | MB/s | CPU% | Notes |
-|---------|------|------|-------|
-| tquic (ours) | - | - | |
+| Библиотека | MB/s | CPU% | Заметки |
+|-----------|------|------|---------|
+| tquic (наш) | - | - | |
 | Quinn | - | - | |
-| tquic (orig) | - | - | |
+| tquic (ориг) | - | - | |
 | quiche | - | - | |
 | s2n-quic | - | - | |
 | neqo | - | - | |
 
-#### Datagram Rate (1200 B packets)
+#### Скорость датаграмм (пакеты по 1200 B)
 
-| Library | pkt/s | MB/s | Loss% | Notes |
-|---------|-------|------|-------|-------|
-| tquic (ours) | - | - | - | |
+| Библиотека | пкт/с | MB/s | Потери% | Заметки |
+|-----------|-------|------|---------|---------|
+| tquic (наш) | - | - | - | |
 | Quinn | - | - | - | |
-| tquic (orig) | - | - | - | |
+| tquic (ориг) | - | - | - | |
 | quiche | - | - | - | |
 | s2n-quic | - | - | - | |
 | neqo | - | - | - | |
 
 ---
 
-## Observations & Analysis
+## Глубокий анализ архитектур
 
-### Architecture Comparison
+### Матрица возможностей
 
-#### Quinn
-- **Strengths:** (TBD after benchmarks)
-- **Weaknesses:** (TBD)
-- **Key patterns to study:**
-  - Batched UDP send/recv (GRO/GSO)
-  - Lock-free connection map
-  - Timer management (single Sleep future)
+| Возможность | Quinn 0.12 | tquic 1.6 | tokio-quiche 0.14 | s2n-quic 1.74 | neqo 0.22 | Наш |
+|---|---|---|---|---|---|---|
+| **Send+Sync** | Да | Нет (Rc) | Да | Да | Нет (Rc) | Да |
+| **GSO** | Да (quinn-udp) | Нет | Через quiche | Да (обязательно) | Нет | Нет |
+| **GRO** | Да (quinn-udp) | Нет | Через quiche | Нет | Нет | Нет |
+| **Пакетная отправка** | sendmmsg | set_send_batch_size | Да | GSO | Нет | Нет |
+| **Пакетный приём** | recvmmsg | Нет | Да | Да | Нет | Нет |
+| **ECN** | Да | Нет | Через quiche | Да | Нет | Нет |
+| **0-RTT** | Да | Да | Да | Unstable | Да | Да |
+| **Датаграммы** | Да | Да (RFC 9221) | Да | Unstable | Да | Да |
+| **Multipath** | Нет | Да | Нет | Нет | Нет | Да |
+| **Congestion** | Cubic/BBR/NewReno | Cubic/BBR/COPA | Cubic+gcongestion | CUBIC | Разные | Через tquic |
+| **Lock tracking** | Опциональный (1ms warn) | Нет | Нет | Нет | Нет | Нет |
 
-#### s2n-quic
-- **Strengths:** (TBD)
-- **Weaknesses:** (TBD)
-- **Key patterns to study:**
-  - io-uring integration
-  - Platform-specific optimizations
-  - Monte Carlo testing methodology
+### Quinn (эталонная реализация)
+- **Архитектура:** `Arc<Mutex<EndpointInner>>` с кастомным мьютексом (опциональный lock tracking: предупреждение при удержании >= 1ms, история последних 20 владельцев)
+- **I/O:** crate quinn-udp: GSO + GRO + recvmmsg + ECN = пакетный I/O через ядро
+- **Ограничитель работы:** `IO_LOOP_BOUND` + `RECV_TIME_BOUND` предотвращают starvation задач
+- **Бенчмарки:** `bencher` микробенчи, `/bench/` bulk transfer CLI, `/perf/` HDR гистограммы + qlog
+- **Ключевой инсайт:** Режим `no-protection` изолирует TLS overhead от QUIC overhead
+- **Что перенять:** GSO/GRO, lock tracking, ограничение работы по времени
 
-#### quiche (Cloudflare)
-- **Strengths:** (TBD)
-- **Weaknesses:** (TBD)
-- **Key patterns to study:**
-  - C core performance
-  - FFI overhead measurement
+### s2n-quic (AWS Production)
+- **Архитектура:** Провайдерная модель (подменяемые TLS, I/O, congestion). Всё через трейты.
+- **I/O:** GSO обязателен (Linux 5.0+), опциональный XDP через eBPF для обхода ядра
+- **Тестирование:** KANI формальная верификация, bolero fuzz-тесты, property-based тесты
+- **Бенчмарки:** criterion 0.8 для внутренних протоколов, s2n-netbench для кросс-сравнений
+- **Ключевой инсайт:** s2n-netbench — лучший инструмент для честного сравнения реализаций
+- **Что перенять:** Обязательность GSO, сценарные netbench, формальная верификация
 
-#### neqo (Mozilla)
-- **Strengths:** (TBD)
-- **Weaknesses:** (TBD)
-- **Key patterns to study:**
-  - NSS crypto performance
-  - Firefox-grade reliability
+### tokio-quiche (Cloudflare Production)
+- **Архитектура:** Акторная модель — QuicListener маршрутизирует пакеты по CID, отдельные IO-воркеры на соединение через каналы
+- **I/O:** Через C-библиотеку quiche (BoringSSL), пул буферов, zero-copy режим
+- **Продакшен:** Питает Apple iCloud Private Relay, Cloudflare Warp MASQUE
+- **Бенчмарки:** Нет публичного criterion suite. Внутренние метрики через feature flags.
+- **Ключевой инсайт:** Акторная модель избегает глобального lock contention, но добавляет overhead каналов
+- **Что изучить:** Акторы на соединение, пул буферов, gcongestion
 
-#### tquic (Tencent original)
-- **Strengths:** (TBD)
-- **Weaknesses:** (TBD)
-- **Key patterns to study:**
-  - Multipath QUIC
-  - BBRv3 congestion control
+### neqo (Mozilla Firefox)
+- **Архитектура:** Sans-I/O стейт-машина, `Rc<RefCell>` (NOT Send+Sync), poll-based
+- **I/O:** `process_input()` / `process_output()` — приноси свой I/O
+- **TLS:** Только NSS (криптобиблиотека Mozilla). Требует установки NSS.
+- **Бенчмарки:** criterion (codspeed-compat) — transfer_walltime, transfer_simulated, rx_stream_orderer
+- **Ключевой инсайт:** Детерминистический сетевой симулятор для тестирования. НЕ для продакшен-серверов.
+- **Что изучить:** Тестирование через симулятор, QLOG-интеграция
+
+### tquic оригинальный (Tencent)
+- **Архитектура:** mio event loop, `Rc<RefCell>` (NOT Send+Sync), аллокатор jemalloc
+- **I/O:** Ручной mio::Poll цикл, приём по одному пакету
+- **Бенчмарки:** Только timer_queue benchmark (criterion 0.3). CI сравнивает с lsquic.
+- **Заявления:** В 4-5 раз быстрее quiche, на 20% быстрее lsquic (по данным tquic.net)
+- **Ключевой инсайт:** Multipath QUIC + BBRv3 — уникальные возможности
+- **Что изучить:** BBRv3 congestion, multipath, использование jemalloc
 
 ---
 
-## Performance Gaps & Action Items
+## Известные разрывы в производительности (до бенчмарков)
 
-> After each benchmark round, document gaps and planned fixes here.
+| Разрыв | Мы | Quinn | Ожидаемое влияние | Сложность исправления |
+|--------|-----|-------|-------------------|----------------------|
+| Нет GSO | try_send_to() по одному | sendmmsg через ядро | ~2x throughput | Средняя (crate quinn-udp) |
+| Нет GRO | poll_recv_from() по одному | recvmmsg пакетами | ~1.5x throughput | Средняя |
+| Нет ECN | Отсутствует | L3 сигнал перегрузки | Лучшее восстановление при потерях | Низкая |
+| Глобальный endpoint lock | process_connections() под ним | То же, но с tracking | Конкуренция под нагрузкой | Структурная |
+| Нет lock tracking | Тихая конкуренция | Предупреждение при 1ms + история | Видимость для отладки | Низкая |
+| Нет пакетной отправки | 1 пакет/syscall | N пакетов/syscall | Эффективность CPU | Средняя |
+| Нет ограничения по времени | Только IO_LOOP_BOUND | + RECV_TIME_BOUND | Справедливость | Низкая |
 
-### Gap Template
+---
+
+## Обнаруженные разрывы и план действий
+
+> После каждого раунда бенчмарков документируем разрывы и план исправлений.
+
+### Шаблон разрыва
 
 ```
-## Gap: [short description]
-- **Observed:** our tquic = X, Quinn = Y (delta: Z%)
-- **Root cause:** [analysis from profiling/code review]
-- **Fix plan:** [what to change]
-- **Status:** [ ] Identified  [ ] Analyzed  [ ] Fixed  [ ] Verified
+## Разрыв: [краткое описание]
+- **Наблюдение:** наш tquic = X, Quinn = Y (дельта: Z%)
+- **Корневая причина:** [анализ из профилирования/ревью кода]
+- **План исправления:** [что менять]
+- **Статус:** [ ] Обнаружен  [ ] Проанализирован  [ ] Исправлен  [ ] Проверен
 ```
 
 ---
 
-## Bugs Found Through Benchmarks
+## Баги, найденные через бенчмарки
 
-> Benchmarks often reveal correctness issues under load.
+> Бенчмарки часто выявляют проблемы корректности под нагрузкой.
 
-| # | Bug | Found via | Severity | Status |
-|---|-----|-----------|----------|--------|
+| # | Баг | Обнаружен через | Критичность | Статус |
+|---|-----|----------------|-------------|--------|
 | | | | | |
 
 ---
 
-## Environment
+## Окружение
 
-- **Hardware:** (TBD — document CPU, RAM, NIC)
-- **OS:** Linux 6.14, Ubuntu
+- **Железо:** (TBD — процессор, RAM, сетевая карта)
+- **ОС:** Linux 6.14, Ubuntu
 - **Rust:** (TBD — `rustc --version`)
-- **Build:** `--release` with LTO
-- **Network:** localhost (round 1), tc/netem for loss simulation (round 2+)
+- **Сборка:** `--release` с LTO
+- **Сеть:** localhost (раунд 1), tc/netem для симуляции потерь (раунд 2+)
 
-## Methodology
+## Методология
 
-1. All benchmarks run in `--release` mode with `opt-level = 3`
-2. Same TLS configuration where possible (self-signed certs)
-3. CPU pinning via `core_affinity` to reduce noise
-4. Minimum 30 samples per measurement (criterion default)
-5. Warm-up phase before measurement
-6. Results include confidence intervals
-7. Flamegraphs for any result >20% slower than best
+1. Все бенчмарки запускаются в `--release` режиме с `opt-level = 3`
+2. Одинаковая TLS-конфигурация где возможно (self-signed сертификаты)
+3. CPU pinning через `core_affinity` для уменьшения шума
+4. Минимум 30 сэмплов на измерение (дефолт criterion)
+5. Фаза прогрева перед измерением
+6. Результаты включают доверительные интервалы
+7. Flamegraph для любого результата >20% хуже лучшего
 
-## Benchmark Crate
+## Запуск бенчмарков
 
-Location: `/src/tolki/tquic/benches/`
-Framework: criterion.rs (primary) + divan (parameterized)
+Расположение: `/src/tquic/benches/`
+Фреймворк: criterion.rs
 
 ```bash
-# Run all benchmarks
-cargo bench -p tquic --features tokio-runtime
+# Запустить все бенчмарки нашего адаптера
+cargo bench -p tquic --features tokio-runtime --bench tokio_adapter
 
-# Run specific category
-cargo bench -p tquic --features tokio-runtime -- handshake
-cargo bench -p tquic --features tokio-runtime -- throughput
-cargo bench -p tquic --features tokio-runtime -- datagram
+# Запустить конкретную категорию
+cargo bench -p tquic --features tokio-runtime --bench tokio_adapter -- handshake
+cargo bench -p tquic --features tokio-runtime --bench tokio_adapter -- throughput
+cargo bench -p tquic --features tokio-runtime --bench tokio_adapter -- datagram
 
-# Generate HTML report
-# Results at: target/criterion/report/index.html
+# Сравнение с Quinn
+cargo bench -p tquic --bench quinn_comparison
+
+# Сравнение с s2n-quic
+cargo bench -p tquic --bench s2n_quic_comparison
+
+# HTML-отчёт
+# Результаты: target/criterion/report/index.html
 ```
 
 ---
 
-## Changelog
+## Журнал изменений
 
-| Date | Round | Changes |
-|------|-------|---------|
-| 2026-02-11 | - | Document created, 6 implementations selected |
-| | Round 1 | TBD: Baseline localhost benchmarks |
-| | Round 2 | TBD: With network simulation (loss, RTT) |
-| | Round 3 | TBD: After optimization pass |
+| Дата | Раунд | Изменения |
+|------|-------|-----------|
+| 2026-02-11 | — | Документ создан, 6 реализаций выбраны |
+| 2026-02-11 | — | Исследование архитектур завершено, разрывы документированы |
+| | Раунд 1 | TBD: Базовые localhost бенчмарки |
+| | Раунд 2 | TBD: С сетевой симуляцией (потери, RTT) |
+| | Раунд 3 | TBD: После прохода оптимизации |
