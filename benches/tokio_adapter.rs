@@ -183,18 +183,19 @@ fn bench_runtime() -> tokio::runtime::Runtime {
 
 /// Measure the time to establish a QUIC connection (connect + handshake).
 ///
-/// TLS configs are pre-built outside the iteration loop so that
-/// BoringSSL certificate loading (~18 ms) is not measured.
+/// Endpoints are pre-built outside the iteration loop so that
+/// UDP socket bind + driver spawn + BoringSSL cert loading are not measured.
 fn bench_handshake(c: &mut Criterion) {
     let rt = bench_runtime();
     let server_config = make_config(true);
     let client_config = make_config(false);
 
     c.bench_function("handshake", |b| {
+        let (mut server, server_addr) = rt.block_on(start_server(server_config.clone()));
+        let client = rt.block_on(start_client(client_config.clone()));
+
         b.iter(|| {
             rt.block_on(async {
-                let (mut server, server_addr) = start_server(server_config.clone()).await;
-                let client = start_client(client_config.clone()).await;
                 let (client_conn, _server_conn) =
                     establish_pair(&mut server, &client, server_addr).await;
                 std::hint::black_box(&client_conn);
@@ -210,7 +211,7 @@ fn bench_handshake(c: &mut Criterion) {
 
 /// Measure bidirectional stream throughput at various payload sizes.
 ///
-/// TLS configs are pre-built outside the iteration loop.
+/// Endpoints are pre-built outside the iteration loop for fair measurement.
 fn bench_stream_throughput(c: &mut Criterion) {
     let rt = bench_runtime();
     let server_config = make_config(true);
@@ -226,9 +227,13 @@ fn bench_stream_throughput(c: &mut Criterion) {
             BenchmarkId::from_parameter(format_size(size)),
             &size,
             |b, &payload_size| {
+                let (mut server, server_addr) = rt.block_on(start_server(sc.clone()));
+                let client = rt.block_on(start_client(cc.clone()));
+
                 b.iter(|| {
                     rt.block_on(async {
-                        run_stream_throughput_iter(sc.clone(), cc.clone(), payload_size).await;
+                        stream_throughput_iter(&mut server, &client, server_addr, payload_size)
+                            .await;
                     });
                 });
             },
@@ -247,18 +252,17 @@ fn format_size(bytes: usize) -> String {
     }
 }
 
-/// Run a single stream throughput iteration.
+/// Run a single stream throughput iteration on pre-built endpoints.
 ///
-/// Creates a connection pair, spawns an echo server,
+/// Establishes a connection, spawns an echo server,
 /// writes `payload_size` bytes and reads the echo back.
-async fn run_stream_throughput_iter(
-    server_config: Config,
-    client_config: Config,
+async fn stream_throughput_iter(
+    server: &mut TquicEndpoint,
+    client: &TquicEndpoint,
+    server_addr: SocketAddr,
     payload_size: usize,
 ) {
-    let (mut server, server_addr) = start_server(server_config).await;
-    let client = start_client(client_config).await;
-    let (client_conn, server_conn) = establish_pair(&mut server, &client, server_addr).await;
+    let (client_conn, server_conn) = establish_pair(server, client, server_addr).await;
 
     let echo_task = tokio::spawn(echo_one_stream(server_conn));
 
@@ -280,7 +284,7 @@ async fn run_stream_throughput_iter(
 
 /// Measure datagram send throughput at various batch sizes.
 ///
-/// TLS configs are pre-built outside the iteration loop.
+/// Endpoints are pre-built outside the iteration loop for fair measurement.
 fn bench_datagram_throughput(c: &mut Criterion) {
     let rt = bench_runtime();
     let server_config = make_config(true);
@@ -296,10 +300,18 @@ fn bench_datagram_throughput(c: &mut Criterion) {
             BenchmarkId::from_parameter(count),
             &count,
             |b, &dgram_count| {
+                let (mut server, server_addr) = rt.block_on(start_server(sc.clone()));
+                let client = rt.block_on(start_client(cc.clone()));
+
                 b.iter(|| {
                     rt.block_on(async {
-                        run_datagram_throughput_iter(sc.clone(), cc.clone(), dgram_count as usize)
-                            .await;
+                        datagram_throughput_iter(
+                            &mut server,
+                            &client,
+                            server_addr,
+                            dgram_count as usize,
+                        )
+                        .await;
                     });
                 });
             },
@@ -309,15 +321,18 @@ fn bench_datagram_throughput(c: &mut Criterion) {
     group.finish();
 }
 
-/// Run a single datagram throughput iteration.
+/// Run a single datagram throughput iteration on pre-built endpoints.
 ///
-/// Creates a connection pair, sends `count` datagrams from client,
+/// Establishes a connection, sends `count` datagrams from client,
 /// and drains them on the server side. The drain is best-effort
 /// since QUIC datagrams are unreliable.
-async fn run_datagram_throughput_iter(server_config: Config, client_config: Config, count: usize) {
-    let (mut server, server_addr) = start_server(server_config).await;
-    let client = start_client(client_config).await;
-    let (client_conn, server_conn) = establish_pair(&mut server, &client, server_addr).await;
+async fn datagram_throughput_iter(
+    server: &mut TquicEndpoint,
+    client: &TquicEndpoint,
+    server_addr: SocketAddr,
+    count: usize,
+) {
+    let (client_conn, server_conn) = establish_pair(server, client, server_addr).await;
 
     let drain_task = tokio::spawn(async move { drain_datagrams(&server_conn, count).await });
 

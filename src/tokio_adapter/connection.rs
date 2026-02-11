@@ -115,11 +115,17 @@ impl TquicConnection {
 
     /// Non-blocking receive-and-process loop.
     ///
-    /// Reads packets from the shared socket and feeds them into the
-    /// endpoint state machine. Returns `true` if at least one packet
-    /// was processed (caller should re-check state immediately).
+    /// Acquires the endpoint lock once, receives all pending UDP
+    /// packets directly into `recv_buf` (zero-copy), then calls
+    /// `process_connections()` once for the entire batch. Does NOT
+    /// wake the background driver since `established()` is already
+    /// driving I/O inline.
+    ///
+    /// Returns `true` if at least one packet was processed.
     fn try_drive_io(&self, recv_buf: &mut [u8], local_addr: SocketAddr) -> bool {
         let mut processed = false;
+        let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
+
         loop {
             match self.inner.endpoint.shared.socket.try_recv_from(recv_buf) {
                 Ok((n, src)) => {
@@ -128,7 +134,8 @@ impl TquicConnection {
                         dst: local_addr,
                         time: Instant::now(),
                     };
-                    self.feed_packet(&recv_buf[..n], &info);
+                    // Zero-copy: pass mutable recv_buf slice directly.
+                    let _ = state.endpoint().recv(&mut recv_buf[..n], &info);
                     processed = true;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -141,22 +148,13 @@ impl TquicConnection {
                 Err(_) => break,
             }
         }
-        processed
-    }
 
-    /// Feed a single received packet into the endpoint and wake the
-    /// driver so it can send any response packets.
-    fn feed_packet(&self, data: &[u8], info: &PacketInfo) {
-        let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
-        // recv() takes &mut [u8] for in-place decryption.
-        let mut buf = data.to_vec();
-        let _ = state.endpoint().recv(&mut buf, info);
-        let _ = state.endpoint().process_connections();
-        let waker = extract_driver_waker(&state);
-        drop(state);
-        if let Some(w) = waker {
-            w.wake();
+        if processed {
+            let _ = state.endpoint().process_connections();
         }
+
+        drop(state);
+        processed
     }
 
     /// Open a new bidirectional QUIC stream.

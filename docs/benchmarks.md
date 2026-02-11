@@ -148,6 +148,149 @@
 > Для больших stream'ов (1MB) Quinn ещё 1.6x быстрее — причина: GSO/GRO (пакетный I/O через ядро).
 > Датаграммы по-прежнему доминируются drain timeout и не информативны.
 
+### Раунд 3: 5-библиотечное сравнение хендшейков (2026-02-11)
+
+> **Изменения:**
+> 1. Fairness fix для s2n-quic — `Server` и `Client` вынесены из цикла итераций (s2n-tls init ~30ms был включён в каждое измерение)
+> 2. Добавлен neqo (Mozilla) — sans-I/O бенчмарк, NSS 3.108, без сокетов
+> 3. Добавлен tokio-quiche (Cloudflare) — отдельный crate `/src/quic-bench-quiche/` из-за конфликта BoringSSL
+>
+> 10 сэмплов, criterion 0.5, `--quick` режим.
+
+#### Задержка хендшейка (localhost, 1-RTT) — 5 библиотек
+
+| Библиотека | Среднее | CI (95%) | vs tquic | Изменение vs Раунд 2 |
+|-----------|---------|----------|----------|----------------------|
+| **s2n-quic** | **1.66 ms** | [1.66 — 1.66] | **0.39x (быстрее!)** | ↓ от 33.7ms, **-95%** (fairness fix) |
+| tquic (наш) | 4.3 ms | — | 1x | Без изменений |
+| Quinn | 5.9 ms | — | 1.37x | Без изменений |
+| neqo (Mozilla) | 6.15 ms | [5.94 — 6.45] | 1.43x | Новый (sans-I/O, NSS) |
+| tokio-quiche (Cloudflare) | 12.0 ms | [11.7 — 12.4] | 2.8x | Новый (акторная модель) |
+| tquic (оригинал) | — | — | — | Пропущен (нет async API) |
+
+#### Пропускная способность потоков s2n-quic (после fairness fix)
+
+| Размер | Время | Throughput | Изменение vs Раунд 1 |
+|--------|-------|-----------|----------------------|
+| 64 KB | 28.7ms | 2.18 MiB/s | ↓ от 35.7ms (-20%) |
+| 1 MB | 36.4ms | 27.4 MiB/s | ↓ от 51.1ms (-29%) |
+
+> **Выводы:**
+> 1. s2n-quic — самый быстрый хендшейк (1.66ms). Причина: s2n-tls (AWS) оптимизирован для TLS 1.3.
+> 2. tquic (наш форк) — 2-е место (4.3ms), быстрее Quinn на 37%.
+> 3. neqo (6.15ms) ≈ Quinn (5.9ms) — несмотря на sans-I/O (без сокетов), NSS TLS не быстрее rustls.
+> 4. tokio-quiche (12.0ms) — самый медленный. Акторная модель (каналы, IoWorker spawn) добавляет overhead.
+> 5. Ранжирование по TLS backend: s2n-tls (1.66ms) > BoringSSL/tquic (4.3ms) > rustls (5.9ms) > NSS (6.15ms) > BoringSSL/quiche (12.0ms).
+>
+> **Важно:** tokio-quiche overhead — НЕ от BoringSSL, а от акторной архитектуры (spawn IoWorker + channel setup per connection).
+> tquic тоже использует BoringSSL и показывает 4.3ms.
+
+### Раунд 4: Полное сравнение — handshake + stream + datagram (2026-02-12)
+
+> **Изменения:**
+> 1. Добавлен **оригинальный tquic 1.6.0** (отдельный crate `/src/quic-bench-tquic-orig/` из-за конфликта BoringSSL) — sans-I/O baseline без Tokio
+> 2. **Три Tier 1 оптимизации** adapter'а: zero-copy recv (убран `data.to_vec()`), батчированный lock (один `process_connections()` на все пакеты), убраны лишние wake'и driver'а
+> 3. Stream benchmarks для **всех** библиотек (1KB, 64KB, 1MB)
+> 4. Datagram benchmarks где поддерживается
+>
+> 10 сэмплов, criterion 0.5, measurement_time 15s.
+
+#### Задержка хендшейка (localhost, 1-RTT) — 6 библиотек
+
+| Библиотека | Среднее | CI (95%) | vs baseline | Runtime | Изм. vs R3 |
+|-----------|---------|----------|-------------|---------|------------|
+| **tquic (оригинал)** | **1.00 ms** | [0.95 — 1.04] | **1x** | sans-I/O | Новый |
+| s2n-quic | 1.89 ms | [1.77 — 2.03] | 1.9x | Tokio | ≈ R3 |
+| **tquic (наш форк)** | **3.01 ms** | [3.01 — 3.81] | 3.0x | Tokio | ↓ от 4.3ms, **-30%** |
+| Quinn | 3.67 ms | [3.52 — 3.87] | 3.7x | Tokio | ↓ от 5.9ms (шум) |
+| neqo (Mozilla) | 6.15 ms | [5.94 — 6.45] | 6.2x | sans-I/O | ≈ R3 |
+| tokio-quiche | 12.0 ms | [11.7 — 12.4] | 12x | Tokio | ≈ R3 |
+
+#### Пропускная способность потоков (bidirectional, включая connection setup)
+
+| Библиотека | 1 KB | 64 KB | 1 MB | Throughput 1MB | Runtime |
+|-----------|------|-------|------|----------------|---------|
+| **tquic (оригинал)** | — | **1.34 ms** | **5.97 ms** | **168 MiB/s** | sans-I/O |
+| s2n-quic | 2.07 ms | 3.96 ms | 17.4 ms | 57.4 MiB/s | Tokio |
+| Quinn | 4.05 ms | 5.06 ms | 16.3 ms | ~61 MiB/s | Tokio |
+| **tquic (наш форк)** | 3.32 ms | 5.14 ms | 35.9 ms | 27.9 MiB/s | Tokio |
+| neqo | — | — | — | — | Нет бенчмарка |
+| tokio-quiche | — | — | — | — | Нет бенчмарка |
+
+#### Скорость датаграмм (1200 B, best-effort)
+
+| Библиотека | 10 пкт | 100 пкт | 1000 пкт | Заметки |
+|-----------|--------|---------|----------|---------|
+| tquic (наш) | 1.06s | 1.06s | 1.06s | Фикс. 1s timeout |
+| Quinn | 256ms | 223ms | 1.06s | Фикс. timeout |
+| tquic (оригинал) | — | — | — | Нет RFC 9221 в v1.6.0 |
+| s2n-quic | — | — | — | API unstable |
+
+> **Ключевые выводы Раунда 4:**
+>
+> 1. **Tokio overhead реален, но НЕ фатален.** Оригинальный tquic (sans-I/O) = 1.00ms, наш adapter = 3.01ms (+200%). Но s2n-quic (тоже Tokio) = 1.89ms (+89%). Разница — в архитектуре adapter'а, не в runtime.
+>
+> 2. **Dual-path mutex contention — главная проблема.** EndpointDriver + TquicConnection оба лочат `Arc<Mutex<EndpointState>>`. Это объясняет 3x overhead на handshake и 6x на stream 1MB.
+>
+> 3. **Stream throughput — самое слабое место.** Для 1MB: мы 28 MiB/s, s2n-quic 57 MiB/s (2x), Quinn 61 MiB/s (2.2x), оригинал 168 MiB/s (6x). Lock contention растёт с объёмом данных.
+>
+> 4. **Три Tier 1 оптимизации дали -30% на handshake** (4.3ms → 3.01ms), но не решили корневую проблему contention.
+>
+> 5. **Рекомендация (подтверждена Codex):** Single-owner reactor — один task владеет transport state, user API через command queue. Целевые метрики: handshake < 2ms, stream 1MB < 10ms.
+>
+> 6. **Датаграммные бенчмарки по-прежнему не информативны** — доминируются timeouts. Оригинальный tquic 1.6.0 не поддерживает DATAGRAM (RFC 9221).
+
+### Раунд 5: Single-Owner Reactor (2026-02-12)
+
+> **Изменения:**
+> 1. **Single-owner reactor** — один tokio task эксклюзивно владеет Endpoint, user API через bounded MPSC каналы + oneshot ответы
+> 2. **Новые файлы:** `cmd.rs`, `reactor.rs`, `reactor_handler.rs`, `reactor_endpoint.rs`, `reactor_connection.rs`, `reactor_stream.rs` (~1,900 LOC)
+> 3. **Feature flag:** `tokio-reactor` (зависит от `tokio-runtime`), тот же публичный API
+> 4. Все 3 интеграционных теста проходят
+> 5. `tolki-client` переключён на `tokio-reactor` — `cargo check -p tolki-client` OK
+>
+> 10 сэмплов, criterion 0.5, measurement_time 15s.
+
+#### Задержка хендшейка (localhost, 1-RTT)
+
+| Библиотека | Среднее | CI (95%) | vs baseline | Изм. vs R4 |
+|-----------|---------|----------|-------------|------------|
+| **tquic (оригинал)** | **1.00 ms** | [0.95 — 1.04] | **1x** | — |
+| s2n-quic | 1.89 ms | [1.77 — 2.03] | 1.9x | — |
+| **tquic reactor** | **2.73 ms** | [2.52 — 3.05] | 2.7x | ↓ от 3.01ms, **-9%** |
+| tquic mutex (R4) | 2.88 ms | [2.63 — 3.15] | 2.9x | ≈ R4 |
+| Quinn | 3.67 ms | [3.52 — 3.87] | 3.7x | — |
+
+#### Пропускная способность потоков (bidirectional, включая connection setup)
+
+| Библиотека | 1 KB | 64 KB | 1 MB | Throughput 1MB | Изм. vs R4 |
+|-----------|------|-------|------|----------------|------------|
+| **tquic (оригинал)** | — | **1.34 ms** | **5.97 ms** | **168 MiB/s** | — |
+| Quinn | 4.05 ms | 5.06 ms | 16.3 ms | ~61 MiB/s | — |
+| s2n-quic | 2.07 ms | 3.96 ms | 17.4 ms | 57.4 MiB/s | — |
+| **tquic reactor** | **3.19 ms** | **4.62 ms** | **21.2 ms** | **47.3 MiB/s** | ↓ от 35.9ms, **-41%**, **+70% throughput** |
+| tquic mutex (R4) | 3.32 ms | 5.14 ms | 45.4 ms | 22.0 MiB/s | Деградация vs R4 |
+
+#### Скорость датаграмм (1200 B, best-effort)
+
+| Библиотека | 10 пкт | 100 пкт | 1000 пкт | Изм. vs R4 |
+|-----------|--------|---------|----------|------------|
+| **tquic reactor** | **221 ms** | **560 ms** | 1.09s | ↓ -79% / ↓ -47% / ≈ |
+| tquic mutex (R4) | 1.06s | 1.06s | 1.06s | — |
+| Quinn | 256ms | 223ms | 1.06s | — |
+
+> **Ключевые выводы Раунда 5:**
+>
+> 1. **Stream throughput — главная победа.** 1MB: 45.4ms → 21.2ms (**-53%**), throughput 22 → 47 MiB/s (**+114%**, 2.1x ускорение). Устранение mutex contention удвоило пропускную способность.
+>
+> 2. **Handshake улучшился незначительно** (3.01ms → 2.73ms, -9%). BoringSSL crypto доминирует в handshake, mutex contention не является bottleneck.
+>
+> 3. **Датаграммы значительно улучшились** для малых батчей (10 пкт: 1.06s → 221ms, -79%). Reactor устраняет contention между send и recv путями.
+>
+> 4. **Остающийся разрыв.** Stream 1MB: мы 47 MiB/s vs s2n-quic 57 MiB/s (1.2x) vs Quinn 61 MiB/s (1.3x) vs sans-I/O 168 MiB/s (3.6x). Следующие шаги: GSO/GRO батчированный I/O, пакетный recvmmsg/sendmmsg.
+>
+> 5. **API полностью совместим.** Переключение `tolki-client` на `tokio-reactor` не потребовало изменений кода — только feature flag в Cargo.toml.
+
 ---
 
 ## Глубокий анализ архитектур
@@ -233,14 +376,31 @@
 - **Корневая причина:** 1) BoringSSL TLS init (~18ms) включался в каждую итерацию бенчмарка (fairness issue). 2) established() ожидал драйвер через Notify вместо inline I/O.
 - **Исправление:** Inline I/O driving в established() + pre-built Config вне цикла итераций.
 - **Результат (R2):** tquic = 4.3ms, Quinn = 5.9ms — **tquic быстрее Quinn!**
+- **Результат (R3):** s2n-quic = 1.66ms после fairness fix — **самый быстрый хендшейк** среди всех 5 библиотек.
 - **Статус:** [x] Обнаружен  [x] Проанализирован  [x] Исправлен  [x] Проверен
 
-### Разрыв 2: Stream throughput 3.3x медленнее Quinn (1MB) → Частично исправлен
+### Разрыв 2: Stream throughput медленнее всех async-библиотек (1MB) → Диагностирован
 - **Наблюдение (R1):** tquic = 17 MiB/s, Quinn = 57 MiB/s (дельта: 235%)
-- **Результат (R2):** tquic = 40 MiB/s, Quinn = 64 MiB/s (дельта: 60%) — улучшение с 3.3x до **1.6x**
-- **Корневая причина оставшегося разрыва:** Нет GSO/GRO (1 пакет/syscall vs батчи), нет пакетной отправки (sendmmsg).
-- **План:** Добавить GSO через quinn-udp crate. Профилирование через flamegraph.
+- **Результат (R2):** tquic = 40 MiB/s, Quinn = 64 MiB/s (дельта: 60%) — улучшение с 3.3x до 1.6x
+- **Результат (R4):** tquic = 28 MiB/s, Quinn = 61 MiB/s, s2n = 57 MiB/s, **оригинальный tquic = 168 MiB/s**
+- **Корневая причина:** Архитектура adapter'а (dual-path mutex contention), а не Tokio per se
+- **Доказательство:** Оригинальный tquic (sans-I/O) = 168 MiB/s, наш Tokio adapter = 28 MiB/s (**6x overhead**)
+- **План:** Single-owner reactor + command queue (см. Разрыв 4)
 - **Статус:** [x] Обнаружен  [x] Проанализирован  [~] Частично исправлен  [ ] Проверен
+
+### Разрыв 4: Архитектура adapter'а — dual-path mutex contention → Диагностирован
+- **Наблюдение (R4):** Оригинальный tquic без Tokio: handshake 1.00ms, stream 1MB 5.97ms. Наш adapter: 3.01ms, 35.9ms.
+- **Корневая причина:** `EndpointDriver` (background) и `TquicConnection` (user API) оба лочат один `Arc<Mutex<EndpointState>>`. Два горячих пути конкурируют за один lock.
+- **Доказательство:** s2n-quic (Tokio) достигает 1.89ms handshake (89% overhead над sans-I/O). У нас 200% overhead. Проблема в архитектуре, не в Tokio.
+- **Рекомендация Codex:** Single-owner reactor — один task/thread владеет всем transport state, user API шлёт команды через channels.
+- **План:**
+  1. Убрать inline I/O из user-facing вызовов
+  2. Dedicated reactor task (единственный владелец Endpoint)
+  3. API handles через bounded command queue + response oneshot
+  4. Batched UDP I/O (recvmmsg/sendmmsg)
+  5. Только потом: parking_lot, custom wakers
+- **Целевые метрики:** handshake < 2ms, stream 1MB < 10ms (уровень s2n-quic)
+- **Статус:** [x] Обнаружен  [x] Проанализирован  [ ] Исправлен  [ ] Проверен
 
 ### Разрыв 3: Датаграммный бенчмарк не информативен
 - **Наблюдение:** Результаты доминируются drain timeout, а не реальной скоростью отправки.
@@ -301,6 +461,14 @@ cargo bench -p tquic --bench quinn_comparison
 # Сравнение с s2n-quic
 cargo bench -p tquic --bench s2n_quic_comparison
 
+# Сравнение с neqo (Mozilla, sans-I/O)
+# Требует: libnss3-dev, LD_LIBRARY_PATH
+cd /src/neqo && cargo bench --bench handshake_bench --features bench -p neqo-transport
+
+# Сравнение с tokio-quiche (Cloudflare)
+# Отдельный crate из-за конфликта BoringSSL
+cd /src/quic-bench-quiche && cargo bench --bench quiche_handshake
+
 # HTML-отчёт
 # Результаты: target/criterion/report/index.html
 ```
@@ -315,5 +483,6 @@ cargo bench -p tquic --bench s2n_quic_comparison
 | 2026-02-11 | — | Исследование архитектур завершено, разрывы документированы |
 | 2026-02-11 | Раунд 1 | Базовые localhost бенчмарки: tquic vs Quinn vs s2n-quic |
 | 2026-02-11 | Раунд 2 | Inline I/O driving + fairness fix → handshake -85%, stream 1MB -60% |
-| | Раунд 3 | TBD: GSO/GRO оптимизация для stream throughput |
-| | Раунд 4 | TBD: С сетевой симуляцией (потери, RTT) |
+| 2026-02-11 | Раунд 3 | 5-библиотечное сравнение: s2n-quic fairness fix, neqo (sans-I/O), tokio-quiche (отдельный crate) |
+| 2026-02-12 | Раунд 4 | 6-библиотечное сравнение: handshake + stream + datagram. Три Tier 1 оптимизации adapter'а. Добавлен оригинальный tquic 1.6.0 (отдельный crate). Архитектурная диагностика: dual-path mutex contention. |
+| 2026-02-12 | Раунд 5 | Single-owner reactor: новая архитектура tokio adapter'а. 6 новых файлов (~1,900 LOC). Stream 1MB -53% (47 MiB/s vs 22 MiB/s). tolki-client переключён на `tokio-reactor`. |

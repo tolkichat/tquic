@@ -44,6 +44,9 @@ h3 = ["dep:sfv"]
 # enable tokio async runtime adapter
 tokio-runtime = ["dep:tokio"]
 
+# enable tokio reactor (single-owner, channel-based) adapter
+tokio-reactor = ["tokio-runtime"]
+
 [dependencies]
 bytes = "1"
 rustc-hash = "1.1"

@@ -32,6 +32,9 @@ pub enum AsyncError {
 
     /// The operation timed out.
     Timeout,
+
+    /// The reactor task has exited.
+    ReactorGone,
 }
 
 impl fmt::Display for AsyncError {
@@ -41,6 +44,7 @@ impl fmt::Display for AsyncError {
             AsyncError::ConnectionClosed => write!(f, "connection closed"),
             AsyncError::ChannelClosed => write!(f, "channel closed"),
             AsyncError::Timeout => write!(f, "timeout"),
+            AsyncError::ReactorGone => write!(f, "reactor task gone"),
         }
     }
 }

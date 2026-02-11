@@ -166,10 +166,11 @@ fn bench_handshake(c: &mut Criterion) {
     let cert = generate_bench_cert();
 
     c.bench_function("s2n_handshake", |b| {
+        let (mut server, addr) = rt.block_on(start_server(&cert));
+        let client = rt.block_on(start_client(&cert));
+
         b.iter(|| {
             rt.block_on(async {
-                let (mut server, addr) = start_server(&cert).await;
-                let client = start_client(&cert).await;
                 let (client_conn, _server_conn) = establish_pair(&mut server, &client, addr).await;
                 std::hint::black_box(&client_conn);
                 client_conn.close(0u32.into());
@@ -195,42 +196,37 @@ fn bench_stream_throughput(c: &mut Criterion) {
             BenchmarkId::from_parameter(format_size(size)),
             &size,
             |b, &payload_size| {
+                let (mut server, addr) = rt.block_on(start_server(&cert));
+                let client = rt.block_on(start_client(&cert));
+
                 b.iter(|| {
-                    rt.block_on(run_stream_iter(&cert, payload_size));
+                    rt.block_on(async {
+                        let (mut client_conn, server_conn) =
+                            establish_pair(&mut server, &client, addr).await;
+                        let echo_task = tokio::spawn(echo_one_stream(server_conn));
+
+                        let payload = vec![0xABu8; payload_size];
+                        let stream = client_conn
+                            .open_bidirectional_stream()
+                            .await
+                            .expect("open_bidirectional_stream");
+                        let (mut recv, mut send) = stream.split();
+
+                        write_and_finish(&mut send, &payload).await;
+                        let received = read_to_end(&mut recv).await;
+
+                        std::hint::black_box(&received);
+                        assert_eq!(received.len(), payload_size, "echo size mismatch");
+
+                        client_conn.close(0u32.into());
+                        let _ = echo_task.await;
+                    });
                 });
             },
         );
     }
 
     group.finish();
-}
-
-/// Run a single stream throughput iteration.
-///
-/// Creates a connection pair, spawns an echo server,
-/// writes `payload_size` bytes and reads the echo back.
-async fn run_stream_iter(cert: &BenchCert, payload_size: usize) {
-    let (mut server, addr) = start_server(cert).await;
-    let client = start_client(cert).await;
-    let (mut client_conn, server_conn) = establish_pair(&mut server, &client, addr).await;
-
-    let echo_task = tokio::spawn(echo_one_stream(server_conn));
-
-    let payload = vec![0xABu8; payload_size];
-    let stream = client_conn
-        .open_bidirectional_stream()
-        .await
-        .expect("open_bidirectional_stream");
-    let (mut recv, mut send) = stream.split();
-
-    write_and_finish(&mut send, &payload).await;
-    let received = read_to_end(&mut recv).await;
-
-    std::hint::black_box(&received);
-    assert_eq!(received.len(), payload_size, "echo size mismatch");
-
-    client_conn.close(0u32.into());
-    let _ = echo_task.await;
 }
 
 // ---------------------------------------------------------------------------

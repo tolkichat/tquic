@@ -30,6 +30,9 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 /// Maximum datagram payload (matches tquic benchmark).
 const DATAGRAM_PAYLOAD_SIZE: usize = 1200;
 
+/// Maximum time to wait for datagram drain on localhost.
+const DGRAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
 // ---------------------------------------------------------------------------
 // TLS / Config helpers
 // ---------------------------------------------------------------------------
@@ -356,11 +359,11 @@ async fn run_datagram_iter(server_config: ServerConfig, client_config: ClientCon
     let dgram_payload = Bytes::from(vec![0xCDu8; DATAGRAM_PAYLOAD_SIZE]);
     send_datagrams(&client_conn, &dgram_payload, count);
 
-    // Give the driver time to deliver packets on localhost.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Brief yield to let the driver flush remaining packets on localhost.
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Best-effort wait: datagrams are unreliable, so don't panic on timeout.
-    let received = tokio::time::timeout(Duration::from_secs(3), drain_task)
+    let received = tokio::time::timeout(DGRAM_DRAIN_TIMEOUT, drain_task)
         .await
         .ok()
         .and_then(|r| r.ok())
