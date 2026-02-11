@@ -29,15 +29,6 @@ use super::reactor::CloseInfo;
 use crate::connection::ConnectionStats;
 use crate::Shutdown;
 
-/// Result of a successful stream read.
-pub struct ReadResult {
-    /// The data read from the stream.
-    pub data: Vec<u8>,
-
-    /// Whether the FIN flag was set (stream fully received).
-    pub fin: bool,
-}
-
 /// Shared connection state between the reactor and user handles.
 ///
 /// Allows the user-facing `TquicConnection` to observe connection
@@ -56,6 +47,38 @@ pub(crate) struct SharedConnState {
     pub(crate) close_info: std::sync::Mutex<Option<CloseInfo>>,
 }
 
+// ---------------------------------------------------------------------------
+// Stream creation results
+// ---------------------------------------------------------------------------
+
+/// Result of opening a bidirectional stream.
+pub(crate) struct OpenBiResult {
+    /// Send-side stream ID.
+    pub(crate) send_id: u64,
+    /// Receive-side stream ID.
+    pub(crate) recv_id: u64,
+}
+
+/// Result of opening a unidirectional stream.
+pub(crate) struct OpenUniResult {
+    /// The stream ID.
+    pub(crate) stream_id: u64,
+}
+
+/// An incoming bidirectional stream from the peer.
+pub(crate) struct IncomingBiStream {
+    /// Send-side stream ID.
+    pub(crate) send_id: u64,
+    /// Receive-side stream ID.
+    pub(crate) recv_id: u64,
+}
+
+/// An incoming unidirectional stream from the peer.
+pub(crate) struct IncomingUniStream {
+    /// The stream ID.
+    pub(crate) stream_id: u64,
+}
+
 /// Handle returned after a successful connect/accept.
 ///
 /// Contains the connection index, remote address, and channels
@@ -71,10 +94,10 @@ pub struct ConnHandle {
     pub(crate) shared: Arc<SharedConnState>,
 
     /// Receiver for incoming bidirectional streams.
-    pub(crate) incoming_bi_rx: mpsc::Receiver<(u64, u64)>,
+    pub(crate) incoming_bi_rx: mpsc::Receiver<IncomingBiStream>,
 
     /// Receiver for incoming unidirectional streams.
-    pub(crate) incoming_uni_rx: mpsc::Receiver<u64>,
+    pub(crate) incoming_uni_rx: mpsc::Receiver<IncomingUniStream>,
 }
 
 /// Control-plane commands (low frequency, always need a response).
@@ -91,13 +114,13 @@ pub enum ControlCmd {
     /// Open a new bidirectional stream.
     OpenBi {
         conn_index: u64,
-        tx: oneshot::Sender<Result<(u64, u64), AsyncError>>,
+        tx: oneshot::Sender<Result<OpenBiResult, AsyncError>>,
     },
 
     /// Open a new unidirectional stream.
     OpenUni {
         conn_index: u64,
-        tx: oneshot::Sender<Result<u64, AsyncError>>,
+        tx: oneshot::Sender<Result<OpenUniResult, AsyncError>>,
     },
 
     /// Close a connection (fire-and-forget).
@@ -119,23 +142,6 @@ pub enum ControlCmd {
 
 /// Data-plane commands (high frequency).
 pub enum DataCmd {
-    /// Write data to a stream.
-    StreamWrite {
-        conn_index: u64,
-        stream_id: u64,
-        data: Bytes,
-        fin: bool,
-        tx: oneshot::Sender<Result<usize, AsyncError>>,
-    },
-
-    /// Read data from a stream.
-    StreamRead {
-        conn_index: u64,
-        stream_id: u64,
-        buf_len: usize,
-        tx: oneshot::Sender<Result<ReadResult, AsyncError>>,
-    },
-
     /// Shut down one direction of a stream (fire-and-forget).
     StreamShutdown {
         conn_index: u64,

@@ -29,9 +29,13 @@ use log::*;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Notify};
 
-use super::cmd::{ConnHandle, ControlCmd, DataCmd, ReadResult, SharedConnState};
+use super::cmd::{
+    ConnHandle, ControlCmd, DataCmd, IncomingBiStream, IncomingUniStream, OpenBiResult,
+    OpenUniResult, SharedConnState,
+};
 use super::error::AsyncError;
 use super::reactor_handler::{HandlerEvent, ReactorHandler};
+use super::shared::{SharedInner, SharedState};
 use crate::{Config, Endpoint, PacketInfo, PacketSendHandler, SharedRc};
 
 /// Channel capacity for control commands.
@@ -65,29 +69,12 @@ pub(crate) struct ReactorConnState {
     pub(crate) shared: Arc<SharedConnState>,
     /// Remote peer address.
     pub(crate) remote_addr: SocketAddr,
-    /// Pending read operations parked due to flow control.
-    pub(crate) pending_reads: HashMap<u64, PendingRead>,
-    /// Pending write operations parked due to flow control.
-    pub(crate) pending_writes: HashMap<u64, PendingWrite>,
     /// Pending datagram recv operations.
     pub(crate) pending_dgram_reads: Vec<oneshot::Sender<Result<Bytes, AsyncError>>>,
     /// Sender for incoming bidi streams (server-side).
-    pub(crate) incoming_bi_tx: Option<mpsc::Sender<(u64, u64)>>,
+    pub(crate) incoming_bi_tx: Option<mpsc::Sender<IncomingBiStream>>,
     /// Sender for incoming uni streams (server-side).
-    pub(crate) incoming_uni_tx: Option<mpsc::Sender<u64>>,
-}
-
-/// A parked read operation.
-pub(crate) struct PendingRead {
-    pub(crate) buf_len: usize,
-    pub(crate) tx: oneshot::Sender<Result<ReadResult, AsyncError>>,
-}
-
-/// A parked write operation.
-pub(crate) struct PendingWrite {
-    pub(crate) data: Bytes,
-    pub(crate) fin: bool,
-    pub(crate) tx: oneshot::Sender<Result<usize, AsyncError>>,
+    pub(crate) incoming_uni_tx: Option<mpsc::Sender<IncomingUniStream>>,
 }
 
 /// Close information for a connection.
@@ -133,11 +120,13 @@ impl PacketSendHandler for UdpSender {
 
 /// The single-owner reactor.
 ///
-/// Owns the tquic `Endpoint` exclusively. Communicates with
-/// user-facing handles via channels.
+/// Wraps the tquic `Endpoint` in `SharedState` (`Arc<Mutex<SharedInner>>`).
+/// Both the reactor and user-facing stream handles access the endpoint
+/// through the Mutex. Stream I/O goes directly through the Mutex;
+/// the reactor handles UDP I/O, timers, commands, and handler events.
 pub(crate) struct Reactor {
-    /// The tquic endpoint (sole owner).
-    endpoint: Endpoint,
+    /// The tquic endpoint behind shared Mutex.
+    shared: SharedState,
     /// UDP socket for I/O.
     socket: Arc<UdpSocket>,
     /// Local address.
@@ -158,6 +147,8 @@ pub(crate) struct Reactor {
     incoming_conn_tx: Option<mpsc::Sender<ConnHandle>>,
     /// Receive buffer.
     recv_buf: Vec<u8>,
+    /// Notify handle: stream handles wake the driver after writes.
+    driver_notify: Arc<Notify>,
 }
 
 /// Channels returned when creating a reactor, for user-facing handles.
@@ -168,6 +159,10 @@ pub(crate) struct ReactorChannels {
     pub(crate) data_tx: mpsc::Sender<DataCmd>,
     /// Receiver for incoming connections (server mode only).
     pub(crate) incoming_conn_rx: Option<mpsc::Receiver<ConnHandle>>,
+    /// Shared endpoint state for direct-call stream I/O.
+    pub(crate) shared: SharedState,
+    /// Notify handle: stream handles wake the driver after writes.
+    pub(crate) driver_notify: Arc<Notify>,
 }
 
 impl Reactor {
@@ -197,8 +192,11 @@ impl Reactor {
         });
         let endpoint = Endpoint::new(Box::new(config), is_server, Box::new(handler), sender);
 
+        let shared: SharedState = Arc::new(std::sync::Mutex::new(SharedInner::new(endpoint)));
+        let driver_notify = Arc::new(Notify::new());
+
         let reactor = Self {
-            endpoint,
+            shared: Arc::clone(&shared),
             socket,
             local_addr,
             control_rx,
@@ -209,12 +207,15 @@ impl Reactor {
             is_server,
             incoming_conn_tx,
             recv_buf: vec![0u8; RECV_BUF_SIZE],
+            driver_notify: Arc::clone(&driver_notify),
         };
 
         let channels = ReactorChannels {
             control_tx,
             data_tx,
             incoming_conn_rx,
+            shared,
+            driver_notify,
         };
 
         Ok((reactor, channels))
@@ -262,6 +263,13 @@ impl Reactor {
                     self.process_and_dispatch();
                 }
 
+                () = self.driver_notify.notified() => {
+                    // Stream handles already wrote data via Mutex.
+                    // Driver just needs to call process_connections
+                    // to generate/send packets.
+                    self.process_and_dispatch();
+                }
+
                 Some(cmd) = self.data_rx.recv() => {
                     self.handle_data(cmd);
                     self.batch_data_commands();
@@ -269,13 +277,23 @@ impl Reactor {
                 }
 
                 () = &mut timer => {
-                    self.endpoint.on_timeout(Instant::now());
+                    {
+                        let mut inner = self.shared.lock()
+                            .expect("shared state poisoned");
+                        inner.endpoint.on_timeout(Instant::now());
+                    }
                     self.process_and_dispatch();
                 }
             }
 
             // Reset timer.
-            let dur = self.endpoint.timeout().unwrap_or(DEFAULT_IDLE_TIMEOUT);
+            let dur = self
+                .shared
+                .lock()
+                .expect("shared state poisoned")
+                .endpoint
+                .timeout()
+                .unwrap_or(DEFAULT_IDLE_TIMEOUT);
             timer.as_mut().reset(tokio::time::Instant::now() + dur);
         }
 
@@ -290,7 +308,8 @@ impl Reactor {
                 dst: self.local_addr,
                 time: Instant::now(),
             };
-            let _ = self.endpoint.recv(&mut self.recv_buf[..n], &info);
+            let mut inner = self.shared.lock().expect("shared state poisoned");
+            let _ = inner.endpoint.recv(&mut self.recv_buf[..n], &info);
         }
     }
 
@@ -346,19 +365,6 @@ impl Reactor {
     /// Handle a data command.
     fn handle_data(&mut self, cmd: DataCmd) {
         match cmd {
-            DataCmd::StreamWrite {
-                conn_index,
-                stream_id,
-                data,
-                fin,
-                tx,
-            } => self.handle_stream_write(conn_index, stream_id, data, fin, tx),
-            DataCmd::StreamRead {
-                conn_index,
-                stream_id,
-                buf_len,
-                tx,
-            } => self.handle_stream_read(conn_index, stream_id, buf_len, tx),
             DataCmd::StreamShutdown {
                 conn_index,
                 stream_id,
@@ -391,7 +397,8 @@ impl Reactor {
         token: Option<&[u8]>,
         tx: oneshot::Sender<Result<ConnHandle, AsyncError>>,
     ) {
-        match self.endpoint.connect(
+        let mut inner = self.shared.lock().expect("shared state poisoned");
+        match inner.endpoint.connect(
             self.local_addr,
             remote,
             Some(server_name),
@@ -400,9 +407,11 @@ impl Reactor {
             None,
         ) {
             Ok(idx) => {
+                drop(inner);
                 self.pending_connects.insert(idx, tx);
             }
             Err(e) => {
+                drop(inner);
                 let _ = tx.send(Err(AsyncError::Tquic(e)));
             }
         }
@@ -412,32 +421,61 @@ impl Reactor {
     fn handle_open_bi(
         &mut self,
         conn_index: u64,
-        tx: oneshot::Sender<Result<(u64, u64), AsyncError>>,
+        tx: oneshot::Sender<Result<OpenBiResult, AsyncError>>,
     ) {
-        let result = self
-            .endpoint
-            .conn_get_mut(conn_index)
-            .ok_or(AsyncError::ConnectionClosed)
-            .and_then(|conn| {
-                let sid = conn.stream_bidi_new(0, false).map_err(AsyncError::Tquic)?;
-                Ok((sid, sid))
-            });
-        let _ = tx.send(result);
+        let mut inner = self.shared.lock().expect("shared state poisoned");
+        let sid = match inner.endpoint.conn_get_mut(conn_index) {
+            Some(conn) => match conn.stream_bidi_new(0, false) {
+                Ok(s) => s,
+                Err(e) => {
+                    drop(inner);
+                    let _ = tx.send(Err(AsyncError::Tquic(e)));
+                    return;
+                }
+            },
+            None => {
+                drop(inner);
+                let _ = tx.send(Err(AsyncError::ConnectionClosed));
+                return;
+            }
+        };
+        drop(inner);
+        let _ = tx.send(Ok(OpenBiResult {
+            send_id: sid,
+            recv_id: sid,
+        }));
     }
 
     /// Open a new unidirectional stream on a connection.
-    fn handle_open_uni(&mut self, conn_index: u64, tx: oneshot::Sender<Result<u64, AsyncError>>) {
-        let result = self
-            .endpoint
-            .conn_get_mut(conn_index)
-            .ok_or(AsyncError::ConnectionClosed)
-            .and_then(|conn| conn.stream_uni_new(0, false).map_err(AsyncError::Tquic));
-        let _ = tx.send(result);
+    fn handle_open_uni(
+        &mut self,
+        conn_index: u64,
+        tx: oneshot::Sender<Result<OpenUniResult, AsyncError>>,
+    ) {
+        let mut inner = self.shared.lock().expect("shared state poisoned");
+        let sid = match inner.endpoint.conn_get_mut(conn_index) {
+            Some(conn) => match conn.stream_uni_new(0, false) {
+                Ok(s) => s,
+                Err(e) => {
+                    drop(inner);
+                    let _ = tx.send(Err(AsyncError::Tquic(e)));
+                    return;
+                }
+            },
+            None => {
+                drop(inner);
+                let _ = tx.send(Err(AsyncError::ConnectionClosed));
+                return;
+            }
+        };
+        drop(inner);
+        let _ = tx.send(Ok(OpenUniResult { stream_id: sid }));
     }
 
     /// Close a connection.
     fn handle_close(&mut self, conn_index: u64, error_code: u64, reason: &[u8]) {
-        if let Some(conn) = self.endpoint.conn_get_mut(conn_index) {
+        let mut inner = self.shared.lock().expect("shared state poisoned");
+        if let Some(conn) = inner.endpoint.conn_get_mut(conn_index) {
             let _ = conn.close(true, error_code, reason);
         }
     }
@@ -448,11 +486,13 @@ impl Reactor {
         conn_index: u64,
         tx: oneshot::Sender<Result<crate::connection::ConnectionStats, AsyncError>>,
     ) {
-        let result = self
+        let mut inner = self.shared.lock().expect("shared state poisoned");
+        let result = inner
             .endpoint
             .conn_get_mut(conn_index)
             .ok_or(AsyncError::ConnectionClosed)
             .map(|conn| conn.stats().clone());
+        drop(inner);
         let _ = tx.send(result);
     }
 }
@@ -462,101 +502,6 @@ impl Reactor {
 // ---------------------------------------------------------------------------
 
 impl Reactor {
-    /// Write data to a stream, parking on flow-control block.
-    fn handle_stream_write(
-        &mut self,
-        conn_index: u64,
-        stream_id: u64,
-        data: Bytes,
-        fin: bool,
-        tx: oneshot::Sender<Result<usize, AsyncError>>,
-    ) {
-        let conn = match self.endpoint.conn_get_mut(conn_index) {
-            Some(c) => c,
-            None => {
-                let _ = tx.send(Err(AsyncError::ConnectionClosed));
-                return;
-            }
-        };
-        match conn.stream_write(stream_id, data.clone(), fin) {
-            Ok(n) => {
-                let _ = tx.send(Ok(n));
-            }
-            Err(crate::Error::Done) => {
-                // Flow-control blocked: park the write.
-                if let Some(cs) = self.connections.get_mut(&conn_index) {
-                    cs.pending_writes
-                        .insert(stream_id, PendingWrite { data, fin, tx });
-                } else {
-                    let _ = tx.send(Err(AsyncError::ConnectionClosed));
-                }
-            }
-            Err(e) => {
-                let _ = tx.send(Err(AsyncError::Tquic(e)));
-            }
-        }
-    }
-
-    /// Read data from a stream, parking if no data available.
-    fn handle_stream_read(
-        &mut self,
-        conn_index: u64,
-        stream_id: u64,
-        buf_len: usize,
-        tx: oneshot::Sender<Result<ReadResult, AsyncError>>,
-    ) {
-        let conn = match self.endpoint.conn_get_mut(conn_index) {
-            Some(c) => c,
-            None => {
-                let _ = tx.send(Err(AsyncError::ConnectionClosed));
-                return;
-            }
-        };
-        let mut buf = vec![0u8; buf_len];
-        match conn.stream_read(stream_id, &mut buf) {
-            Ok((n, fin)) => {
-                buf.truncate(n);
-                let _ = tx.send(Ok(ReadResult { data: buf, fin }));
-            }
-            Err(crate::Error::Done) => {
-                if conn.stream_finished(stream_id) {
-                    let _ = tx.send(Ok(ReadResult {
-                        data: Vec::new(),
-                        fin: true,
-                    }));
-                } else {
-                    // No data: park the read.
-                    self.park_read(conn_index, stream_id, buf_len, tx);
-                }
-            }
-            Err(crate::Error::StreamStateError) => {
-                let _ = tx.send(Ok(ReadResult {
-                    data: Vec::new(),
-                    fin: true,
-                }));
-            }
-            Err(e) => {
-                let _ = tx.send(Err(AsyncError::Tquic(e)));
-            }
-        }
-    }
-
-    /// Park a read operation until data arrives.
-    fn park_read(
-        &mut self,
-        conn_index: u64,
-        stream_id: u64,
-        buf_len: usize,
-        tx: oneshot::Sender<Result<ReadResult, AsyncError>>,
-    ) {
-        if let Some(cs) = self.connections.get_mut(&conn_index) {
-            cs.pending_reads
-                .insert(stream_id, PendingRead { buf_len, tx });
-        } else {
-            let _ = tx.send(Err(AsyncError::ConnectionClosed));
-        }
-    }
-
     /// Shut down one direction of a stream.
     fn handle_stream_shutdown(
         &mut self,
@@ -565,7 +510,8 @@ impl Reactor {
         direction: crate::Shutdown,
         error_code: u64,
     ) {
-        if let Some(conn) = self.endpoint.conn_get_mut(conn_index) {
+        let mut inner = self.shared.lock().expect("shared state poisoned");
+        if let Some(conn) = inner.endpoint.conn_get_mut(conn_index) {
             let _ = conn.stream_shutdown(stream_id, direction, error_code);
         }
     }
@@ -577,11 +523,13 @@ impl Reactor {
         data: Bytes,
         tx: oneshot::Sender<Result<(), AsyncError>>,
     ) {
-        let result = self
+        let mut inner = self.shared.lock().expect("shared state poisoned");
+        let result = inner
             .endpoint
             .conn_get_mut(conn_index)
             .ok_or(AsyncError::ConnectionClosed)
             .and_then(|conn| conn.dgram_send(data).map_err(AsyncError::Tquic));
+        drop(inner);
         let _ = tx.send(result);
     }
 
@@ -591,18 +539,22 @@ impl Reactor {
         conn_index: u64,
         tx: oneshot::Sender<Result<Bytes, AsyncError>>,
     ) {
-        let conn = match self.endpoint.conn_get_mut(conn_index) {
+        let mut inner = self.shared.lock().expect("shared state poisoned");
+        let conn = match inner.endpoint.conn_get_mut(conn_index) {
             Some(c) => c,
             None => {
+                drop(inner);
                 let _ = tx.send(Err(AsyncError::ConnectionClosed));
                 return;
             }
         };
         match conn.dgram_recv() {
             Ok(data) => {
+                drop(inner);
                 let _ = tx.send(Ok(data));
             }
             Err(crate::Error::Done) => {
+                drop(inner);
                 // No datagram: park the recv.
                 if let Some(cs) = self.connections.get_mut(&conn_index) {
                     cs.pending_dgram_reads.push(tx);
@@ -611,6 +563,7 @@ impl Reactor {
                 }
             }
             Err(e) => {
+                drop(inner);
                 let _ = tx.send(Err(AsyncError::Tquic(e)));
             }
         }
@@ -624,6 +577,7 @@ impl Reactor {
 impl Reactor {
     /// Drain non-blocking UDP receives.
     fn drain_udp_recv(&mut self) {
+        let mut inner = self.shared.lock().expect("shared state poisoned");
         loop {
             match self.socket.try_recv_from(&mut self.recv_buf) {
                 Ok((n, src)) => {
@@ -632,7 +586,7 @@ impl Reactor {
                         dst: self.local_addr,
                         time: Instant::now(),
                     };
-                    let _ = self.endpoint.recv(&mut self.recv_buf[..n], &info);
+                    let _ = inner.endpoint.recv(&mut self.recv_buf[..n], &info);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(ref e)
@@ -648,7 +602,10 @@ impl Reactor {
 
     /// Process connections and dispatch handler events.
     fn process_and_dispatch(&mut self) {
-        let _ = self.endpoint.process_connections();
+        {
+            let mut inner = self.shared.lock().expect("shared state poisoned");
+            let _ = inner.endpoint.process_connections();
+        }
         self.drain_handler_events();
     }
 
@@ -718,8 +675,6 @@ impl Reactor {
         let state = ReactorConnState {
             shared: Arc::clone(&shared),
             remote_addr: remote,
-            pending_reads: HashMap::new(),
-            pending_writes: HashMap::new(),
             pending_dgram_reads: Vec::new(),
             incoming_bi_tx: Some(bi_tx),
             incoming_uni_tx: Some(uni_tx),
@@ -735,8 +690,8 @@ impl Reactor {
         index: u64,
         remote: SocketAddr,
         shared: Arc<SharedConnState>,
-        incoming_bi_rx: mpsc::Receiver<(u64, u64)>,
-        incoming_uni_rx: mpsc::Receiver<u64>,
+        incoming_bi_rx: mpsc::Receiver<IncomingBiStream>,
+        incoming_uni_rx: mpsc::Receiver<IncomingUniStream>,
     ) {
         let handle = ConnHandle {
             conn_index: index,
@@ -777,19 +732,24 @@ impl Reactor {
         };
         *cs.shared.close_info.lock().expect("close_info lock") = Some(info);
         Self::fail_pending_ops(&mut cs);
+
+        // Wake all stream wakers so blocked reads/writes return errors.
+        let wakers = self
+            .shared
+            .lock()
+            .expect("shared state poisoned")
+            .remove_conn_wakers(index);
+        for w in wakers {
+            w.wake();
+        }
+
         cs.incoming_bi_tx.take();
         cs.incoming_uni_tx.take();
         cs.shared.closed.notify_waiters();
     }
 
-    /// Fail all pending read/write/dgram operations on a connection.
+    /// Fail all pending datagram operations on a connection.
     fn fail_pending_ops(cs: &mut ReactorConnState) {
-        for (_, pr) in cs.pending_reads.drain() {
-            let _ = pr.tx.send(Err(AsyncError::ConnectionClosed));
-        }
-        for (_, pw) in cs.pending_writes.drain() {
-            let _ = pw.tx.send(Err(AsyncError::ConnectionClosed));
-        }
         for tx in cs.pending_dgram_reads.drain(..) {
             let _ = tx.send(Err(AsyncError::ConnectionClosed));
         }
@@ -803,118 +763,79 @@ impl Reactor {
 impl Reactor {
     /// Handle a peer-initiated stream being created.
     fn on_stream_created(&mut self, index: u64, stream_id: u64) {
-        let Some(cs) = self.connections.get(&index) else {
-            return;
-        };
         let is_bidi = stream_id & 0x2 == 0;
 
         if is_bidi {
-            if let Some(tx) = &cs.incoming_bi_tx {
-                if tx.try_send((stream_id, stream_id)).is_err() {
-                    warn!("incoming bidi stream {stream_id} dropped: channel full");
-                }
+            self.create_incoming_bidi(index, stream_id);
+        } else {
+            self.create_incoming_uni(index, stream_id);
+        }
+    }
+
+    /// Deliver an incoming bidirectional stream (IDs only, no slots).
+    fn create_incoming_bidi(&mut self, index: u64, stream_id: u64) {
+        let Some(cs) = self.connections.get_mut(&index) else {
+            return;
+        };
+        let incoming = IncomingBiStream {
+            send_id: stream_id,
+            recv_id: stream_id,
+        };
+        if let Some(tx) = &cs.incoming_bi_tx {
+            if tx.try_send(incoming).is_err() {
+                warn!("incoming bidi stream {stream_id} dropped: channel full");
             }
-        } else if let Some(tx) = &cs.incoming_uni_tx {
-            if tx.try_send(stream_id).is_err() {
+        }
+    }
+
+    /// Deliver an incoming unidirectional stream (ID only, no slots).
+    fn create_incoming_uni(&mut self, index: u64, stream_id: u64) {
+        let Some(cs) = self.connections.get_mut(&index) else {
+            return;
+        };
+        let incoming = IncomingUniStream { stream_id };
+        if let Some(tx) = &cs.incoming_uni_tx {
+            if tx.try_send(incoming).is_err() {
                 warn!("incoming uni stream {stream_id} dropped: channel full");
             }
         }
     }
 
-    /// Retry a parked read when the stream becomes readable.
+    /// Wake the read waker when the stream becomes readable.
     fn on_stream_readable(&mut self, index: u64, stream_id: u64) {
-        let pending = self
-            .connections
-            .get_mut(&index)
-            .and_then(|cs| cs.pending_reads.remove(&stream_id));
-        let Some(pr) = pending else { return };
-
-        self.retry_parked_read(index, stream_id, pr);
-    }
-
-    /// Attempt to complete a previously-parked read.
-    fn retry_parked_read(&mut self, index: u64, stream_id: u64, pr: PendingRead) {
-        let conn = match self.endpoint.conn_get_mut(index) {
-            Some(c) => c,
-            None => {
-                let _ = pr.tx.send(Err(AsyncError::ConnectionClosed));
-                return;
-            }
-        };
-        let mut buf = vec![0u8; pr.buf_len];
-        match conn.stream_read(stream_id, &mut buf) {
-            Ok((n, fin)) => {
-                buf.truncate(n);
-                let _ = pr.tx.send(Ok(ReadResult { data: buf, fin }));
-            }
-            Err(crate::Error::Done) => {
-                if conn.stream_finished(stream_id) {
-                    let _ = pr.tx.send(Ok(ReadResult {
-                        data: Vec::new(),
-                        fin: true,
-                    }));
-                } else {
-                    // Re-park.
-                    if let Some(cs) = self.connections.get_mut(&index) {
-                        cs.pending_reads.insert(stream_id, pr);
-                    }
-                }
-            }
-            Err(e) => {
-                let _ = pr.tx.send(Err(AsyncError::Tquic(e)));
-            }
+        let waker = self
+            .shared
+            .lock()
+            .expect("shared state poisoned")
+            .take_read_waker(index, stream_id);
+        if let Some(w) = waker {
+            w.wake();
         }
     }
 
-    /// Retry a parked write when the stream becomes writable.
+    /// Wake the write waker when the stream becomes writable.
     fn on_stream_writable(&mut self, index: u64, stream_id: u64) {
-        let pending = self
-            .connections
-            .get_mut(&index)
-            .and_then(|cs| cs.pending_writes.remove(&stream_id));
-        let Some(pw) = pending else { return };
-
-        self.retry_parked_write(index, stream_id, pw);
-    }
-
-    /// Attempt to complete a previously-parked write.
-    fn retry_parked_write(&mut self, index: u64, stream_id: u64, pw: PendingWrite) {
-        let conn = match self.endpoint.conn_get_mut(index) {
-            Some(c) => c,
-            None => {
-                let _ = pw.tx.send(Err(AsyncError::ConnectionClosed));
-                return;
-            }
-        };
-        match conn.stream_write(stream_id, pw.data.clone(), pw.fin) {
-            Ok(n) => {
-                let _ = pw.tx.send(Ok(n));
-            }
-            Err(crate::Error::Done) => {
-                // Still blocked, re-park.
-                if let Some(cs) = self.connections.get_mut(&index) {
-                    cs.pending_writes.insert(stream_id, pw);
-                }
-            }
-            Err(e) => {
-                let _ = pw.tx.send(Err(AsyncError::Tquic(e)));
-            }
+        let waker = self
+            .shared
+            .lock()
+            .expect("shared state poisoned")
+            .take_write_waker(index, stream_id);
+        if let Some(w) = waker {
+            w.wake();
         }
     }
 
-    /// Handle a stream being closed.
+    /// Wake both wakers when a stream is closed.
     fn on_stream_closed(&mut self, index: u64, stream_id: u64) {
-        let Some(cs) = self.connections.get_mut(&index) else {
-            return;
-        };
-        if let Some(pr) = cs.pending_reads.remove(&stream_id) {
-            let _ = pr.tx.send(Ok(ReadResult {
-                data: Vec::new(),
-                fin: true,
-            }));
+        let mut inner = self.shared.lock().expect("shared state poisoned");
+        let ww = inner.take_write_waker(index, stream_id);
+        let rw = inner.take_read_waker(index, stream_id);
+        drop(inner);
+        if let Some(w) = ww {
+            w.wake();
         }
-        if let Some(pw) = cs.pending_writes.remove(&stream_id) {
-            let _ = pw.tx.send(Err(AsyncError::ConnectionClosed));
+        if let Some(w) = rw {
+            w.wake();
         }
     }
 
@@ -943,7 +864,8 @@ impl Reactor {
         index: u64,
         pending: Vec<oneshot::Sender<Result<Bytes, AsyncError>>>,
     ) -> Vec<oneshot::Sender<Result<Bytes, AsyncError>>> {
-        let conn = match self.endpoint.conn_get_mut(index) {
+        let mut inner = self.shared.lock().expect("shared state poisoned");
+        let conn = match inner.endpoint.conn_get_mut(index) {
             Some(c) => c,
             None => return Vec::new(),
         };
@@ -971,8 +893,19 @@ impl Reactor {
 // ---------------------------------------------------------------------------
 
 impl Reactor {
-    /// Shutdown: fail all pending operations.
+    /// Shutdown: fail all pending operations and wake all wakers.
     fn shutdown_all(&mut self) {
+        // Collect all connection indices before draining.
+        let indices: Vec<u64> = self.connections.keys().copied().collect();
+
+        // Wake all stream wakers across all connections.
+        {
+            let mut inner = self.shared.lock().expect("shared state poisoned");
+            for &idx in &indices {
+                let _ = inner.remove_conn_wakers(idx);
+            }
+        }
+
         for (_, mut cs) in self.connections.drain() {
             Self::fail_pending_ops(&mut cs);
             cs.shared.closed.notify_waiters();
@@ -980,6 +913,10 @@ impl Reactor {
         for (_, tx) in self.pending_connects.drain() {
             let _ = tx.send(Err(AsyncError::ConnectionClosed));
         }
-        self.endpoint.close(true);
+        self.shared
+            .lock()
+            .expect("shared state poisoned")
+            .endpoint
+            .close(true);
     }
 }

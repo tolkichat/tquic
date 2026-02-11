@@ -18,19 +18,21 @@
 //! All operations are `Send + Sync` without any mutexes.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use super::cmd::{ConnHandle, ControlCmd, DataCmd};
 use super::error::AsyncError;
 use super::reactor::{Reactor, ReactorChannels};
 use super::reactor_connection::TquicConnection;
+use super::shared::SharedState;
 use crate::Config;
 
 /// A `Send + Sync` async QUIC endpoint handle (reactor version).
 ///
 /// Communicates with the reactor task via channels.
-/// No mutexes are needed for any operation.
+/// Holds the shared endpoint state for direct-call stream I/O.
 pub struct TquicEndpoint {
     /// Sender for control-plane commands.
     control_tx: mpsc::Sender<ControlCmd>,
@@ -43,6 +45,12 @@ pub struct TquicEndpoint {
 
     /// Receiver for incoming connections (server only).
     incoming_conn_rx: Option<mpsc::Receiver<ConnHandle>>,
+
+    /// Shared endpoint state for direct-call stream I/O.
+    shared: SharedState,
+
+    /// Wake the driver to call `process_connections` / send packets.
+    driver_notify: Arc<Notify>,
 }
 
 impl TquicEndpoint {
@@ -66,6 +74,8 @@ impl TquicEndpoint {
             data_tx: channels.data_tx,
             local_addr,
             incoming_conn_rx: channels.incoming_conn_rx,
+            shared: channels.shared,
+            driver_notify: channels.driver_notify,
         })
     }
 
@@ -94,6 +104,8 @@ impl TquicEndpoint {
             self.control_tx.clone(),
             self.data_tx.clone(),
             handle.shared,
+            self.shared.clone(),
+            Arc::clone(&self.driver_notify),
             handle.incoming_bi_rx,
             handle.incoming_uni_rx,
         ))
@@ -111,6 +123,8 @@ impl TquicEndpoint {
             self.control_tx.clone(),
             self.data_tx.clone(),
             handle.shared,
+            self.shared.clone(),
+            Arc::clone(&self.driver_notify),
             handle.incoming_bi_rx,
             handle.incoming_uni_rx,
         ))

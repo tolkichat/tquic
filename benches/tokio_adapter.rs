@@ -13,7 +13,7 @@ use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
 };
 
-use tquic::tokio_adapter::{RecvStream, SendStream, TquicConnection, TquicEndpoint};
+use tquic::tokio_adapter::{AsyncError, RecvStream, SendStream, TquicConnection, TquicEndpoint};
 use tquic::{Config, TlsConfig};
 
 // ---------------------------------------------------------------------------
@@ -23,8 +23,22 @@ use tquic::{Config, TlsConfig};
 /// Read buffer size for stream operations.
 const READ_BUF_SIZE: usize = 65536;
 
+/// Larger read buffer for throughput benchmarks (2 MB).
+///
+/// A 2 MB heap buffer reduces per-1 MB transfer from 16 reads to 1,
+/// avoiding loop overhead and `extend_from_slice` copies.
+const THROUGHPUT_READ_BUF_SIZE: usize = 2 * 1024 * 1024;
+
 /// Maximum time to wait for datagram drain on localhost.
 const DGRAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Maximum stream iterations per connection before proactive refresh.
+///
+/// tquic connections degrade after many rapid stream cycles
+/// (accumulated stream state, flow-control updates). Refreshing
+/// every N iterations avoids random mid-sample failures while
+/// keeping reconnection cost out of the measurement.
+const WARM_CONN_LIFETIME: u64 = 50;
 
 // ---------------------------------------------------------------------------
 // TLS / Config helpers
@@ -44,11 +58,14 @@ fn make_config(is_server: bool) -> Config {
 fn configure_quic_params(conf: &mut Config) {
     conf.set_max_idle_timeout(30_000);
     conf.set_recv_udp_payload_size(1350);
-    conf.set_initial_max_data(10_000_000);
-    conf.set_initial_max_stream_data_bidi_local(1_000_000);
-    conf.set_initial_max_stream_data_bidi_remote(1_000_000);
+    // Large windows to support warm-connection benchmarks (many iterations).
+    conf.set_max_connection_window(1024 * 1024 * 1024);
+    conf.set_max_stream_window(64 * 1024 * 1024);
+    conf.set_initial_max_data(1024 * 1024 * 1024);
+    conf.set_initial_max_stream_data_bidi_local(64 * 1024 * 1024);
+    conf.set_initial_max_stream_data_bidi_remote(64 * 1024 * 1024);
     conf.set_initial_max_stream_data_uni(1_000_000);
-    conf.set_initial_max_streams_bidi(100);
+    conf.set_initial_max_streams_bidi(100_000);
     conf.set_initial_max_streams_uni(100);
     conf.set_max_datagram_frame_size(65535);
 }
@@ -119,19 +136,35 @@ async fn wait_for_handshake(client: &TquicConnection, server: &TquicConnection) 
 // ---------------------------------------------------------------------------
 
 /// Write all data and signal FIN on a send stream.
-async fn write_and_finish(send: &SendStream, data: &[u8]) {
-    send.write_all(data).await.expect("stream write_all");
-    send.finish().await.expect("stream finish");
+async fn write_and_finish(send: &SendStream, data: &[u8]) -> Result<(), AsyncError> {
+    send.write_all(data).await?;
+    send.finish().await
+}
+
+/// Read all data from a recv stream until FIN using a small stack buffer.
+async fn read_to_end(recv: &RecvStream) -> Result<Vec<u8>, AsyncError> {
+    read_to_end_with_buf(recv, READ_BUF_SIZE).await
+}
+
+/// Read all data from a recv stream using a large heap buffer.
+///
+/// The 2 MB buffer reduces per-1 MB transfer from 16 reads to 1,
+/// cutting loop overhead and `extend_from_slice` copies.
+async fn read_to_end_large(recv: &RecvStream) -> Result<Vec<u8>, AsyncError> {
+    read_to_end_with_buf(recv, THROUGHPUT_READ_BUF_SIZE).await
 }
 
 /// Read all data from a recv stream until FIN.
-async fn read_to_end(recv: &RecvStream) -> Vec<u8> {
+///
+/// Uses a heap-allocated buffer of the given size to avoid
+/// stack overflow with large buffers.
+async fn read_to_end_with_buf(recv: &RecvStream, buf_size: usize) -> Result<Vec<u8>, AsyncError> {
     let mut result = Vec::new();
-    let mut buf = [0u8; READ_BUF_SIZE];
+    let mut buf = vec![0u8; buf_size];
     loop {
-        match recv.read(&mut buf).await.expect("stream read") {
+        match recv.read(&mut buf).await? {
             Some(n) => result.extend_from_slice(&buf[..n]),
-            None => return result,
+            None => return Ok(result),
         }
     }
 }
@@ -146,8 +179,10 @@ async fn echo_one_stream(mut server_conn: TquicConnection) {
         .accept_bi()
         .await
         .expect("server accept_bi for echo");
-    let data = read_to_end(&srv_recv).await;
-    write_and_finish(&srv_send, &data).await;
+    let data = read_to_end(&srv_recv).await.expect("cold echo read");
+    write_and_finish(&srv_send, &data)
+        .await
+        .expect("cold echo write");
 }
 
 /// Run a datagram sink that reads `count` datagrams from a connection.
@@ -268,8 +303,10 @@ async fn stream_throughput_iter(
 
     let payload = vec![0xABu8; payload_size];
     let (client_send, client_recv) = client_conn.open_bi().await.expect("open_bi");
-    write_and_finish(&client_send, &payload).await;
-    let received = read_to_end(&client_recv).await;
+    write_and_finish(&client_send, &payload)
+        .await
+        .expect("cold bench write");
+    let received = read_to_end(&client_recv).await.expect("cold bench read");
 
     std::hint::black_box(&received);
     assert_eq!(received.len(), payload_size, "echo size mismatch");
@@ -279,7 +316,178 @@ async fn stream_throughput_iter(
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark group 3: Datagram throughput
+// Benchmark group 3: Stream throughput (warm connection)
+// ---------------------------------------------------------------------------
+
+/// Measure stream throughput with a pre-established connection.
+///
+/// Unlike [`bench_stream_throughput`], the QUIC handshake happens once
+/// *before* the benchmark loop. Each iteration only measures:
+/// `open_bi -> write -> server echo -> read`.
+fn bench_stream_throughput_warm(c: &mut Criterion) {
+    let rt = bench_runtime();
+    let server_config = make_config(true);
+    let client_config = make_config(false);
+    let mut group = c.benchmark_group("stream_throughput_warm");
+    group.sampling_mode(SamplingMode::Flat);
+
+    for &size in &[1024, 64 * 1024, 1024 * 1024] {
+        bench_warm_for_size(&rt, &mut group, &server_config, &client_config, size);
+    }
+
+    group.finish();
+}
+
+/// Run the warm throughput benchmark for a single payload size.
+///
+/// Uses `iter_custom` to exclude connection re-establishment time
+/// from the measurement. Only stream I/O is timed.
+fn bench_warm_for_size(
+    rt: &tokio::runtime::Runtime,
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    server_config: &Config,
+    client_config: &Config,
+    size: usize,
+) {
+    group.throughput(Throughput::Bytes(size as u64));
+    let sc = server_config.clone();
+    let cc = client_config.clone();
+    group.bench_with_input(
+        BenchmarkId::from_parameter(format_size(size)),
+        &size,
+        |b, &payload_size| {
+            let (mut server, server_addr) = rt.block_on(start_server(sc.clone()));
+            let client = rt.block_on(start_client(cc.clone()));
+            let (mut client_conn, mut server_conn) =
+                rt.block_on(establish_pair(&mut server, &client, server_addr));
+
+            b.iter_custom(|iters| {
+                warm_iter_custom(
+                    rt,
+                    iters,
+                    &mut server,
+                    &client,
+                    server_addr,
+                    &mut client_conn,
+                    &mut server_conn,
+                    payload_size,
+                )
+            });
+        },
+    );
+}
+
+/// Run `iters` warm echo iterations, timing only stream I/O.
+///
+/// Proactively refreshes the connection every [`WARM_CONN_LIFETIME`]
+/// iterations and also on unexpected closure. Reconnection time
+/// is excluded from the returned duration.
+#[allow(clippy::too_many_arguments)]
+fn warm_iter_custom(
+    rt: &tokio::runtime::Runtime,
+    iters: u64,
+    server: &mut TquicEndpoint,
+    client: &TquicEndpoint,
+    server_addr: SocketAddr,
+    client_conn: &mut TquicConnection,
+    server_conn: &mut TquicConnection,
+    payload_size: usize,
+) -> Duration {
+    let mut total = Duration::ZERO;
+    let mut done: u64 = 0;
+    let mut conn_iter: u64 = 0;
+
+    while done < iters {
+        // Proactive refresh to avoid degraded connections.
+        if conn_iter >= WARM_CONN_LIFETIME {
+            reconnect(rt, server, client, server_addr, client_conn, server_conn);
+            conn_iter = 0;
+        }
+
+        let start = std::time::Instant::now();
+        let ok = rt.block_on(warm_echo_iter(client_conn, server_conn, payload_size));
+        if ok {
+            total += start.elapsed();
+            done += 1;
+            conn_iter += 1;
+        } else {
+            reconnect(rt, server, client, server_addr, client_conn, server_conn);
+            conn_iter = 0;
+        }
+    }
+    total
+}
+
+/// Re-establish client and server connections (untimed).
+fn reconnect(
+    rt: &tokio::runtime::Runtime,
+    server: &mut TquicEndpoint,
+    client: &TquicEndpoint,
+    server_addr: SocketAddr,
+    client_conn: &mut TquicConnection,
+    server_conn: &mut TquicConnection,
+) {
+    let (cc, sc) = rt.block_on(establish_pair(server, client, server_addr));
+    *client_conn = cc;
+    *server_conn = sc;
+}
+
+/// One warm-connection echo iteration (no handshake overhead).
+///
+/// The client write is spawned so that the server can `accept_bi`
+/// concurrently. The server echoes data back inline, then the
+/// client reads the echo.
+async fn warm_echo_iter(
+    client_conn: &TquicConnection,
+    server_conn: &mut TquicConnection,
+    payload_size: usize,
+) -> bool {
+    let payload = vec![0xABu8; payload_size];
+
+    // Client opens a stream; if connection is closed, signal caller.
+    let (client_send, client_recv) = match client_conn.open_bi().await {
+        Ok(pair) => pair,
+        Err(_) => return false,
+    };
+
+    // Spawn the client write so the server can accept concurrently.
+    let write_task = tokio::spawn(async move {
+        let _ = write_and_finish(&client_send, &payload).await;
+    });
+
+    // Server accepts the peer-initiated stream and echoes data back.
+    let (srv_send, srv_recv) = match server_conn.accept_bi().await {
+        Some(pair) => pair,
+        None => {
+            let _ = write_task.await;
+            return false;
+        }
+    };
+    let data = match read_to_end_large(&srv_recv).await {
+        Ok(d) => d,
+        Err(_) => {
+            let _ = write_task.await;
+            return false;
+        }
+    };
+    if write_and_finish(&srv_send, &data).await.is_err() {
+        let _ = write_task.await;
+        return false;
+    }
+
+    // Client waits for write to finish, then reads the echo.
+    let _ = write_task.await;
+    let received = match read_to_end_large(&client_recv).await {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    std::hint::black_box(&received);
+    assert_eq!(received.len(), payload_size, "echo size mismatch");
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark group 4: Datagram throughput
 // ---------------------------------------------------------------------------
 
 /// Measure datagram send throughput at various batch sizes.
@@ -377,4 +585,14 @@ criterion_group! {
         .warm_up_time(Duration::from_secs(3));
     targets = bench_handshake, bench_stream_throughput, bench_datagram_throughput
 }
-criterion_main!(benches);
+
+criterion_group! {
+    name = benches_warm;
+    config = Criterion::default()
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(10))
+        .warm_up_time(Duration::from_secs(1));
+    targets = bench_stream_throughput_warm
+}
+
+criterion_main!(benches, benches_warm);

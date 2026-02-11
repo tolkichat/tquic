@@ -38,6 +38,8 @@ pub use stream::{RecvStream, SendStream};
 #[cfg(feature = "tokio-reactor")]
 mod cmd;
 #[cfg(feature = "tokio-reactor")]
+mod direct_stream;
+#[cfg(feature = "tokio-reactor")]
 mod reactor;
 #[cfg(feature = "tokio-reactor")]
 mod reactor_connection;
@@ -46,11 +48,11 @@ mod reactor_endpoint;
 #[cfg(feature = "tokio-reactor")]
 mod reactor_handler;
 #[cfg(feature = "tokio-reactor")]
-mod reactor_stream;
+mod shared;
 
+#[cfg(feature = "tokio-reactor")]
+pub use direct_stream::{RecvStream, SendStream};
 #[cfg(feature = "tokio-reactor")]
 pub use reactor_connection::TquicConnection;
 #[cfg(feature = "tokio-reactor")]
 pub use reactor_endpoint::TquicEndpoint;
-#[cfg(feature = "tokio-reactor")]
-pub use reactor_stream::{RecvStream, SendStream};

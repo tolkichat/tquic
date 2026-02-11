@@ -22,12 +22,13 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
-use super::cmd::{ControlCmd, DataCmd, SharedConnState};
+use super::cmd::{ControlCmd, DataCmd, IncomingBiStream, IncomingUniStream, SharedConnState};
+use super::direct_stream::{RecvStream, SendStream};
 use super::error::AsyncError;
 use super::reactor::CloseInfo;
-use super::reactor_stream::{RecvStream, SendStream};
+use super::shared::SharedState;
 use crate::connection::ConnectionStats;
 
 /// Close information for a connection.
@@ -45,8 +46,8 @@ pub struct ConnectionCloseInfo {
 
 /// A `Send + Sync` async QUIC connection handle (reactor version).
 ///
-/// Holds channel senders for communicating with the reactor.
-/// All operations are lock-free.
+/// Holds channel senders for communicating with the reactor
+/// and shared endpoint state for direct-call stream I/O.
 pub struct TquicConnection {
     /// The tquic connection index within the endpoint.
     conn_index: u64,
@@ -63,23 +64,32 @@ pub struct TquicConnection {
     /// Shared lifecycle state with the reactor.
     shared: Arc<SharedConnState>,
 
+    /// Shared endpoint state for direct-call stream I/O.
+    shared_inner: SharedState,
+
+    /// Wake the driver to call `process_connections` / send packets.
+    driver_notify: Arc<Notify>,
+
     /// Receiver for incoming bidirectional streams from the peer.
-    incoming_bi_rx: mpsc::Receiver<(u64, u64)>,
+    incoming_bi_rx: mpsc::Receiver<IncomingBiStream>,
 
     /// Receiver for incoming unidirectional streams from the peer.
-    incoming_uni_rx: mpsc::Receiver<u64>,
+    incoming_uni_rx: mpsc::Receiver<IncomingUniStream>,
 }
 
 impl TquicConnection {
     /// Create a new connection handle.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         conn_index: u64,
         remote_addr: SocketAddr,
         control_tx: mpsc::Sender<ControlCmd>,
         data_tx: mpsc::Sender<DataCmd>,
         shared: Arc<SharedConnState>,
-        incoming_bi_rx: mpsc::Receiver<(u64, u64)>,
-        incoming_uni_rx: mpsc::Receiver<u64>,
+        shared_inner: SharedState,
+        driver_notify: Arc<Notify>,
+        incoming_bi_rx: mpsc::Receiver<IncomingBiStream>,
+        incoming_uni_rx: mpsc::Receiver<IncomingUniStream>,
     ) -> Self {
         Self {
             conn_index,
@@ -87,6 +97,8 @@ impl TquicConnection {
             control_tx,
             data_tx,
             shared,
+            shared_inner,
+            driver_notify,
             incoming_bi_rx,
             incoming_uni_rx,
         }
@@ -130,9 +142,21 @@ impl TquicConnection {
             .await
             .map_err(|_| AsyncError::ReactorGone)?;
 
-        let (send_id, recv_id) = rx.await.map_err(|_| AsyncError::ReactorGone)??;
-        let send = SendStream::new(send_id, self.conn_index, self.data_tx.clone());
-        let recv = RecvStream::new(recv_id, self.conn_index, self.data_tx.clone());
+        let result = rx.await.map_err(|_| AsyncError::ReactorGone)??;
+        let send = SendStream::new(
+            result.send_id,
+            self.conn_index,
+            self.shared_inner.clone(),
+            Arc::clone(&self.driver_notify),
+            self.data_tx.clone(),
+        );
+        let recv = RecvStream::new(
+            result.recv_id,
+            self.conn_index,
+            self.shared_inner.clone(),
+            Arc::clone(&self.driver_notify),
+            self.data_tx.clone(),
+        );
         Ok((send, recv))
     }
 
@@ -147,10 +171,12 @@ impl TquicConnection {
             .await
             .map_err(|_| AsyncError::ReactorGone)?;
 
-        let stream_id = rx.await.map_err(|_| AsyncError::ReactorGone)??;
+        let result = rx.await.map_err(|_| AsyncError::ReactorGone)??;
         Ok(SendStream::new(
-            stream_id,
+            result.stream_id,
             self.conn_index,
+            self.shared_inner.clone(),
+            Arc::clone(&self.driver_notify),
             self.data_tx.clone(),
         ))
     }
@@ -159,9 +185,21 @@ impl TquicConnection {
     ///
     /// Returns `None` if the connection has been closed.
     pub async fn accept_bi(&mut self) -> Option<(SendStream, RecvStream)> {
-        let (send_id, recv_id) = self.incoming_bi_rx.recv().await?;
-        let send = SendStream::new(send_id, self.conn_index, self.data_tx.clone());
-        let recv = RecvStream::new(recv_id, self.conn_index, self.data_tx.clone());
+        let incoming = self.incoming_bi_rx.recv().await?;
+        let send = SendStream::new(
+            incoming.send_id,
+            self.conn_index,
+            self.shared_inner.clone(),
+            Arc::clone(&self.driver_notify),
+            self.data_tx.clone(),
+        );
+        let recv = RecvStream::new(
+            incoming.recv_id,
+            self.conn_index,
+            self.shared_inner.clone(),
+            Arc::clone(&self.driver_notify),
+            self.data_tx.clone(),
+        );
         Some((send, recv))
     }
 
@@ -169,10 +207,12 @@ impl TquicConnection {
     ///
     /// Returns `None` if the connection has been closed.
     pub async fn accept_uni(&mut self) -> Option<RecvStream> {
-        let stream_id = self.incoming_uni_rx.recv().await?;
+        let incoming = self.incoming_uni_rx.recv().await?;
         Some(RecvStream::new(
-            stream_id,
+            incoming.stream_id,
             self.conn_index,
+            self.shared_inner.clone(),
+            Arc::clone(&self.driver_notify),
             self.data_tx.clone(),
         ))
     }
