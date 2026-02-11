@@ -254,3 +254,30 @@ impl crate::ConnectionIdGenerator for ConnectionIdGenerator {
         cid_len as usize
     }
 }
+
+// Safety: FFI handler and sender types contain raw pointers that are
+// inherently thread-unsafe. However, the FFI contract already requires
+// that the C caller manages thread safety for these callbacks. When
+// tokio-runtime is enabled, these unsafe impls allow the types to be
+// used in Send+Sync trait object contexts. The actual thread safety
+// is the responsibility of the FFI caller, which is already the case
+// for the existing mio-based code.
+#[cfg(feature = "tokio-runtime")]
+unsafe impl Send for TransportHandler {}
+#[cfg(feature = "tokio-runtime")]
+unsafe impl Sync for TransportHandler {}
+
+#[cfg(feature = "tokio-runtime")]
+unsafe impl Send for PacketSendHandler {}
+#[cfg(feature = "tokio-runtime")]
+unsafe impl Sync for PacketSendHandler {}
+
+#[cfg(feature = "tokio-runtime")]
+unsafe impl Send for TransportContext {}
+#[cfg(feature = "tokio-runtime")]
+unsafe impl Sync for TransportContext {}
+
+#[cfg(feature = "tokio-runtime")]
+unsafe impl Send for PacketSendContext {}
+#[cfg(feature = "tokio-runtime")]
+unsafe impl Sync for PacketSendContext {}

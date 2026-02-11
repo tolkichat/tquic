@@ -18,12 +18,16 @@
 
 use core::ops::Range;
 use std::any::Any;
+#[cfg(not(feature = "tokio-runtime"))]
 use std::cell::RefCell;
 use std::cmp;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+#[cfg(not(feature = "tokio-runtime"))]
 use std::rc::Rc;
 use std::time;
+
+use crate::{shared_borrow_mut, SharedRc, SharedRefCell};
 
 use bytes::Bytes;
 use enumflags2::bitflags;
@@ -110,7 +114,7 @@ pub struct Connection {
 
     /// The crypto streams for Initial/Handshake/1RTT level, each of which
     /// starts at an offset of 0.
-    crypto_streams: Rc<RefCell<CryptoStreams>>,
+    crypto_streams: SharedRc<SharedRefCell<CryptoStreams>>,
 
     /// Raw packets that were received before decryption keys are available.
     undecryptable_packets: UndecryptablePackets,
@@ -162,7 +166,7 @@ pub struct Connection {
     events: EventQueue,
 
     /// Status observed by the endpoint.
-    queues: Option<Rc<RefCell<ConnectionQueues>>>,
+    queues: Option<SharedRc<SharedRefCell<ConnectionQueues>>>,
 
     /// User context for the connection.
     context: Option<Box<dyn Any + Send + Sync>>,
@@ -264,7 +268,7 @@ impl Connection {
             multipath_conf: conf.multipath.clone(),
             streams,
             tls_session,
-            crypto_streams: Rc::new(RefCell::new(CryptoStreams::new())),
+            crypto_streams: SharedRc::new(SharedRefCell::new(CryptoStreams::new())),
             undecryptable_packets: UndecryptablePackets::new(conf.max_undecryptable_packets),
             peer_transport_params: TransportParams::default(),
             local_transport_params: conf.local_transport_params.clone(),
@@ -603,7 +607,7 @@ enum ConnectionFlags {
 
 /// Statistics about a QUIC connection.
 #[repr(C)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ConnectionStats {
     /// Total number of received packets.
     pub recv_count: u64,

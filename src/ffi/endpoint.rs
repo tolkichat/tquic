@@ -14,9 +14,10 @@
 
 use std::ffi;
 use std::ptr;
-use std::rc::Rc;
 use std::slice;
 use std::time::Instant;
+
+use crate::SharedRc;
 
 use libc::c_char;
 use libc::c_int;
@@ -62,7 +63,7 @@ pub extern "C" fn quic_endpoint_new(
         methods: handler_methods,
         context: handler_ctx,
     });
-    let sender = Rc::new(PacketSendHandler {
+    let sender = SharedRc::new(PacketSendHandler {
         methods: sender_methods,
         context: sender_ctx,
     });

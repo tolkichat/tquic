@@ -239,7 +239,7 @@ impl TlsConfig {
     }
 }
 
-pub(crate) struct DefaultTlsConfigSelector {
+pub struct DefaultTlsConfigSelector {
     pub tls_config: Arc<TlsConfig>,
 }
 
@@ -270,6 +270,9 @@ pub struct Keys {
     pub seal: Option<Seal>,
 }
 
+#[cfg(feature = "tokio-runtime")]
+pub type WriteMethod = Box<dyn FnMut(Level, &[u8]) -> Result<()> + Send>;
+#[cfg(not(feature = "tokio-runtime"))]
 pub type WriteMethod = Box<dyn FnMut(Level, &[u8]) -> Result<()>>;
 type KeyLog = Box<dyn std::io::Write + Send + Sync>;
 
@@ -671,8 +674,8 @@ pub struct TlsError {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::{shared_borrow_mut, SharedRc, SharedRefCell};
     use rand;
-    use std::cell::RefCell;
     use std::collections::{HashMap, VecDeque};
     use std::rc::Rc;
 
@@ -738,12 +741,12 @@ pub(crate) mod tests {
 
     fn generate_tls_session_data_buf(
         tls_session: &mut TlsSession,
-    ) -> Rc<RefCell<VecDeque<DataBuf>>> {
+    ) -> SharedRc<SharedRefCell<VecDeque<DataBuf>>> {
         let data_buf: VecDeque<DataBuf> = VecDeque::new();
-        let data_buf = Rc::new(RefCell::new(data_buf));
-        let cloned_data_buf = Rc::clone(&data_buf);
+        let data_buf = SharedRc::new(SharedRefCell::new(data_buf));
+        let cloned_data_buf = SharedRc::clone(&data_buf);
         let write_method = move |level: Level, buf: &[u8]| {
-            cloned_data_buf.borrow_mut().push_back(DataBuf {
+            shared_borrow_mut(&cloned_data_buf).push_back(DataBuf {
                 level,
                 buf: buf.to_vec(),
             });
@@ -760,10 +763,10 @@ pub(crate) mod tests {
 
     struct TlsSessionPair {
         client: TlsSession,
-        client_out_queue: Rc<RefCell<VecDeque<DataBuf>>>,
+        client_out_queue: SharedRc<SharedRefCell<VecDeque<DataBuf>>>,
 
         server: TlsSession,
-        server_out_queue: Rc<RefCell<VecDeque<DataBuf>>>,
+        server_out_queue: SharedRc<SharedRefCell<VecDeque<DataBuf>>>,
     }
 
     impl TlsSessionPair {
@@ -847,8 +850,8 @@ pub(crate) mod tests {
             }
 
             while !(self.client.is_completed() && self.server.is_completed()) {
-                while !self.client_out_queue.borrow_mut().is_empty() {
-                    let data_buf = self.client_out_queue.borrow_mut().pop_front();
+                while !shared_borrow_mut(&self.client_out_queue).is_empty() {
+                    let data_buf = shared_borrow_mut(&self.client_out_queue).pop_front();
                     let data_buf = data_buf.unwrap();
                     match self.server.provide(data_buf.level, &data_buf.buf) {
                         Ok(_) => break,
@@ -859,8 +862,8 @@ pub(crate) mod tests {
                     };
                 }
 
-                while !self.server_out_queue.borrow_mut().is_empty() {
-                    let data_buf = self.server_out_queue.borrow_mut().pop_front();
+                while !shared_borrow_mut(&self.server_out_queue).is_empty() {
+                    let data_buf = shared_borrow_mut(&self.server_out_queue).pop_front();
                     let data_buf = data_buf.unwrap();
                     match self.client.provide(data_buf.level, &data_buf.buf) {
                         Ok(_) => break,

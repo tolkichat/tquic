@@ -16,6 +16,8 @@
 
 use super::*;
 
+use crate::shared_borrow_mut;
+
 impl Connection {
     /// Process an incoming UDP datagram from the peer.
     ///
@@ -411,7 +413,7 @@ impl Connection {
                     // the TLS session. It may be mutably borrowed during calling
                     // self.tls_session.read(). Do NOT mutably borrrow it again at the
                     // same scope.
-                    let mut crypto_streams = self.crypto_streams.borrow_mut();
+                    let mut crypto_streams = shared_borrow_mut(&self.crypto_streams);
                     let crypto_stream = crypto_streams.get_mut(level)?;
                     crypto_stream.recv.write(offset, data, false)?;
                 }
@@ -420,7 +422,7 @@ impl Connection {
                 let mut crypto_buf = [0; 512];
                 loop {
                     let read = {
-                        let mut crypto_streams = self.crypto_streams.borrow_mut();
+                        let mut crypto_streams = shared_borrow_mut(&self.crypto_streams);
                         let crypto_stream = crypto_streams.get_mut(level)?;
                         match crypto_stream.recv.read(&mut crypto_buf) {
                             Ok((read, _)) => read,

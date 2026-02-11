@@ -16,6 +16,8 @@
 
 use super::*;
 
+use crate::shared_borrow_mut;
+
 impl Connection {
     pub(crate) fn max_datagram_size(&self, pid: usize) -> usize {
         // The peer's `max_udp_payload_size` transport parameter limits the
@@ -1006,7 +1008,7 @@ impl Connection {
         }
 
         let level = pkt_type.to_level()?;
-        let mut crypto_streams = self.crypto_streams.borrow_mut();
+        let mut crypto_streams = shared_borrow_mut(&self.crypto_streams);
         let stream = crypto_streams.get_mut(level)?;
         let out = &mut out[st.written..];
 
@@ -1398,7 +1400,7 @@ impl Connection {
                     // acknowledged.
                     Frame::Crypto { offset, length, .. } => {
                         let level = space.id.to_level();
-                        let mut crypto_streams = self.crypto_streams.borrow_mut();
+                        let mut crypto_streams = shared_borrow_mut(&self.crypto_streams);
                         if let Ok(stream) = crypto_streams.get_mut(level) {
                             stream.send.retransmit(offset, length);
                         }
@@ -1619,7 +1621,7 @@ impl Connection {
             }
 
             // We are ready to send data for this packet number space.
-            let mut crypto_streams = self.crypto_streams.borrow_mut();
+            let mut crypto_streams = shared_borrow_mut(&self.crypto_streams);
             if crypto_streams.get_mut(level)?.is_sendable() {
                 return Ok(*pkt_type);
             }

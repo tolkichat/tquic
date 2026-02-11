@@ -81,6 +81,47 @@ use crate::tls::TlsSession;
 use crate::token::ResetToken;
 use crate::trans_param::TransportParams;
 
+// ---------------------------------------------------------------------------
+// Feature-gated Send+Sync type aliases
+// ---------------------------------------------------------------------------
+// When `tokio-runtime` is enabled, use Arc/Mutex so that Endpoint and
+// Connection become Send+Sync, enabling a Quinn-style Future-based driver
+// that can be spawned on a multi-threaded tokio runtime.
+// When disabled (default / FFI path), use Rc/RefCell for zero-overhead
+// single-threaded usage.
+
+#[cfg(feature = "tokio-runtime")]
+pub(crate) type SharedRc<T> = std::sync::Arc<T>;
+#[cfg(not(feature = "tokio-runtime"))]
+pub(crate) type SharedRc<T> = std::rc::Rc<T>;
+
+#[cfg(feature = "tokio-runtime")]
+pub(crate) type SharedRefCell<T> = std::sync::Mutex<T>;
+#[cfg(not(feature = "tokio-runtime"))]
+pub(crate) type SharedRefCell<T> = std::cell::RefCell<T>;
+
+/// Immutably borrow the inner value.
+#[cfg(feature = "tokio-runtime")]
+pub(crate) fn shared_borrow<T>(cell: &SharedRefCell<T>) -> std::sync::MutexGuard<'_, T> {
+    cell.lock().unwrap_or_else(|e| e.into_inner())
+}
+/// Immutably borrow the inner value.
+#[cfg(not(feature = "tokio-runtime"))]
+pub(crate) fn shared_borrow<T>(cell: &SharedRefCell<T>) -> std::cell::Ref<'_, T> {
+    cell.borrow()
+}
+
+/// Mutably borrow the inner value.
+#[cfg(feature = "tokio-runtime")]
+pub(crate) fn shared_borrow_mut<T>(cell: &SharedRefCell<T>) -> std::sync::MutexGuard<'_, T> {
+    cell.lock().unwrap_or_else(|e| e.into_inner())
+}
+/// Mutably borrow the inner value.
+#[cfg(not(feature = "tokio-runtime"))]
+pub(crate) fn shared_borrow_mut<T>(cell: &SharedRefCell<T>) -> std::cell::RefMut<'_, T> {
+    cell.borrow_mut()
+}
+
 /// The current QUIC wire version.
 pub const QUIC_VERSION: u32 = QUIC_VERSION_V1;
 
@@ -1334,6 +1375,7 @@ pub use crate::multipath_scheduler::MultipathAlgorithm;
 pub use crate::multipath_scheduler::MultipathBondMode;
 pub use crate::packet::PacketHeader;
 pub use crate::tls::CertCompressionAlgorithm;
+pub use crate::tls::DefaultTlsConfigSelector;
 pub use crate::tls::TlsConfig;
 pub use crate::tls::TlsConfigSelector;
 

@@ -17,6 +17,8 @@
 
 use super::*;
 
+use crate::{shared_borrow_mut, SharedRc, SharedRefCell};
+
 impl Connection {
     /// Set peer context for the specific path
     pub fn set_path_peer_context<T: Any + Send + Sync>(
@@ -469,7 +471,7 @@ impl Connection {
             return;
         }
         self.tls_session.drop_keys(level);
-        let mut crypto_streams = self.crypto_streams.borrow_mut();
+        let mut crypto_streams = shared_borrow_mut(&self.crypto_streams);
         crypto_streams.clear(level);
 
         // When Initial and Handshake packet protection keys are discarded, all
@@ -650,7 +652,7 @@ impl Connection {
     pub(super) fn get_write_method(&mut self) -> tls::WriteMethod {
         let crypto_streams = self.crypto_streams.clone();
         Box::new(move |level, data| {
-            let mut crypto_streams = crypto_streams.borrow_mut();
+            let mut crypto_streams = shared_borrow_mut(&crypto_streams);
             let stream = crypto_streams.get_mut(level)?;
             stream.send.write(Bytes::copy_from_slice(data), false)?;
             Ok(())
@@ -1044,7 +1046,7 @@ impl Connection {
     }
 
     /// Set the queues shared by the endpoint and the connection.
-    pub(crate) fn set_queues(&mut self, queues: Rc<RefCell<ConnectionQueues>>) {
+    pub(crate) fn set_queues(&mut self, queues: SharedRc<SharedRefCell<ConnectionQueues>>) {
         self.queues = Some(queues);
     }
 
@@ -1095,7 +1097,7 @@ impl Connection {
 
         if let Some(idx) = self.index {
             let mut queues = match &self.queues {
-                Some(v) => v.borrow_mut(),
+                Some(v) => shared_borrow_mut(v),
                 None => unreachable!(),
             };
             if tickable {
@@ -1123,7 +1125,7 @@ impl Connection {
 
         if let Some(idx) = self.index {
             let mut queues = match &self.queues {
-                Some(v) => v.borrow_mut(),
+                Some(v) => shared_borrow_mut(v),
                 None => unreachable!(),
             };
             if sendable {

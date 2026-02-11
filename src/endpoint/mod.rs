@@ -21,12 +21,16 @@ mod connection_table;
 mod packet_buffer;
 mod packet_queue;
 
+#[cfg(not(feature = "tokio-runtime"))]
 use std::cell::RefCell;
 use std::cmp;
 use std::net::SocketAddr;
+#[cfg(not(feature = "tokio-runtime"))]
 use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
+
+use crate::{shared_borrow, shared_borrow_mut, SharedRc, SharedRefCell};
 
 use log::*;
 use ring::hmac;
@@ -82,7 +86,7 @@ pub struct Endpoint {
     timers: TimerQueue,
 
     /// Various connection queues.
-    queues: Rc<RefCell<ConnectionQueues>>,
+    queues: SharedRc<SharedRefCell<ConnectionQueues>>,
 
     /// Connection ID Generator.
     cid_gen: Box<dyn ConnectionIdGenerator>,
@@ -91,7 +95,10 @@ pub struct Endpoint {
     handler: Box<dyn TransportHandler>,
 
     /// Used to send packet out.
-    sender: Rc<dyn PacketSendHandler>,
+    #[cfg(feature = "tokio-runtime")]
+    sender: SharedRc<dyn PacketSendHandler + Send + Sync>,
+    #[cfg(not(feature = "tokio-runtime"))]
+    sender: SharedRc<dyn PacketSendHandler>,
 
     /// Buffer for ZeroRTT packets that arrive before Initial packets due to
     /// potential misordering or loss of Initial packets.
@@ -107,13 +114,21 @@ pub struct Endpoint {
     trace_id: String,
 }
 
+// SAFETY: Under `tokio-runtime`, all trait objects inside Endpoint
+// (ConnectionIdGenerator, TransportHandler) and inside Connection
+// (MultipathScheduler, CongestionController) are concrete types that
+// are Send. Access is serialized by the Mutex in the tokio adapter.
+#[cfg(feature = "tokio-runtime")]
+unsafe impl Send for Endpoint {}
+
 impl Endpoint {
     /// Create a QUIC endpoint.
     pub fn new(
         config: Box<crate::Config>,
         is_server: bool,
         handler: Box<dyn TransportHandler>,
-        sender: Rc<dyn PacketSendHandler>,
+        #[cfg(feature = "tokio-runtime")] sender: SharedRc<dyn PacketSendHandler + Send + Sync>,
+        #[cfg(not(feature = "tokio-runtime"))] sender: SharedRc<dyn PacketSendHandler>,
     ) -> Self {
         let cid_gen = Box::new(crate::RandomConnectionIdGenerator {
             cid_len: config.cid_len,
@@ -128,7 +143,7 @@ impl Endpoint {
             conns: ConnectionTable::new(),
             routes: ConnectionRoutes::new(),
             timers: TimerQueue::new(),
-            queues: Rc::new(RefCell::new(ConnectionQueues::new())),
+            queues: SharedRc::new(SharedRefCell::new(ConnectionQueues::new())),
             cid_gen,
             handler,
             sender,
@@ -557,7 +572,7 @@ impl Endpoint {
     /// Return the amount of time until the next timeout event.
     pub fn timeout(&self) -> Option<Duration> {
         // There are still events pending
-        let queues = self.queues.borrow();
+        let queues = shared_borrow(&self.queues);
         if !self.packets.is_empty() || !queues.is_empty() {
             return Some(crate::TIMER_GRANULARITY);
         }
@@ -795,25 +810,25 @@ impl Endpoint {
 
     /// Return the index of a tickable connection
     fn conn_tickable_next(&mut self) -> Option<u64> {
-        let queues = self.queues.borrow_mut();
+        let queues = shared_borrow_mut(&self.queues);
         queues.tickable_next()
     }
 
     /// Return the number of tickable connections
     fn conn_tickable_len(&self) -> usize {
-        let queues = self.queues.borrow();
+        let queues = shared_borrow(&self.queues);
         queues.tickable.len()
     }
 
     /// Return the index of a sendable connection
     fn conn_sendable_next(&mut self) -> Option<u64> {
-        let queues = self.queues.borrow_mut();
+        let queues = shared_borrow_mut(&self.queues);
         queues.sendable_next()
     }
 
     /// Return the number of sendble connections
     fn conn_sendable_len(&self) -> usize {
-        let queues = self.queues.borrow();
+        let queues = shared_borrow(&self.queues);
         queues.sendable.len()
     }
 

@@ -99,7 +99,7 @@ impl TestPair {
             let token = token.as_ref().map(Vec::as_ref);
 
             let cli_hdl = Box::new(ClientHandler::new(cli_case_conf, Arc::clone(&cli_stop)));
-            let cli_sock = Rc::new(cli_sock);
+            let cli_sock = SharedRc::new(cli_sock);
             let mut endpoint = Endpoint::new(Box::new(cli_conf), false, cli_hdl, cli_sock.clone());
 
             endpoint
@@ -112,7 +112,7 @@ impl TestPair {
         // Create and run server endpoint in child thread
         let server = thread::spawn(move || {
             let srv_hdl = Box::new(ServerHandler::new(srv_case_conf, Arc::clone(&srv_stop)));
-            let srv_sock = Rc::new(srv_sock);
+            let srv_sock = SharedRc::new(srv_sock);
 
             let mut endpoint = Endpoint::new(Box::new(srv_conf), true, srv_hdl, srv_sock.clone());
             TestPair::event_loop(&mut endpoint, &mut srv_poll, &srv_sock, &srv_stop).unwrap();
@@ -308,7 +308,7 @@ struct TestSocketState {
 struct TestSocket {
     socket: mio::net::UdpSocket,
 
-    state: RefCell<TestSocketState>,
+    state: SharedRefCell<TestSocketState>,
 
     /// Used for simulating packet loss (0~100)
     packet_loss: u32,
@@ -339,7 +339,7 @@ impl TestSocket {
         reg.register(&mut socket, TOKEN, mio::Interest::READABLE)
             .unwrap();
 
-        let state = RefCell::new(TestSocketState {
+        let state = SharedRefCell::new(TestSocketState {
             rng: StepRng::new(0, 1),
             filter: None,
         });
@@ -358,7 +358,7 @@ impl TestSocket {
 
     /// Set the customized packter filter
     fn set_filter(&mut self, filter: Box<dyn PacketFilter + Send>) {
-        self.state.borrow_mut().filter = Some(filter);
+        shared_borrow_mut(&self.state).filter = Some(filter);
     }
 
     /// Return the local socket address.
@@ -368,7 +368,7 @@ impl TestSocket {
 
     /// Whether an abnormal event should be injected.
     fn sampling(&self, rate: u32) -> bool {
-        self.state.borrow_mut().rng.next_u32() % 100 < rate
+        shared_borrow_mut(&self.state).rng.next_u32() % 100 < rate
     }
 
     /// Filter packets which are delayed long enough.
@@ -417,7 +417,7 @@ impl TestSocket {
         while start < pkts.len() {
             let end = cmp::min(start + window, pkts.len());
             let range = &mut pkts[start..end];
-            range.shuffle(&mut self.state.borrow_mut().rng);
+            range.shuffle(&mut shared_borrow_mut(&self.state).rng);
             start = end;
         }
         trace!(
@@ -481,8 +481,11 @@ impl PacketSendHandler for TestSocket {
         let mut count = 0;
 
         let mut pkts = pkts.to_vec();
-        if let Some(ref mut f) = &mut self.state.borrow_mut().filter {
-            f.filter(&mut pkts);
+        {
+            let mut state = shared_borrow_mut(&self.state);
+            if let Some(ref mut f) = &mut state.filter {
+                f.filter(&mut pkts);
+            }
         }
 
         // Simulate event of packet delay
@@ -563,20 +566,20 @@ impl PacketFilter for FirstPacketFilter {
 
 // A mocked socket which implements PacketSendHandler.
 struct MockSocket {
-    packets: RefCell<Vec<(Vec<u8>, PacketInfo)>>,
+    packets: SharedRefCell<Vec<(Vec<u8>, PacketInfo)>>,
 }
 
 impl MockSocket {
     fn new() -> Self {
         MockSocket {
-            packets: RefCell::new(Vec::new()),
+            packets: SharedRefCell::new(Vec::new()),
         }
     }
 
     // Delivery the outgoing packets to the target endpoint
     fn transfer(&self, e: &mut Endpoint) -> Result<usize> {
-        let count = self.packets.borrow().len();
-        let mut packets = self.packets.borrow_mut();
+        let count = shared_borrow(&self.packets).len();
+        let mut packets = shared_borrow_mut(&self.packets);
         for (pkt, info) in packets.iter_mut() {
             e.recv(pkt, info)?;
         }
@@ -587,7 +590,7 @@ impl MockSocket {
 
 impl PacketSendHandler for MockSocket {
     fn on_packets_send(&self, pkts: &[(Vec<u8>, PacketInfo)]) -> crate::Result<usize> {
-        let mut packets = self.packets.borrow_mut();
+        let mut packets = shared_borrow_mut(&self.packets);
         packets.extend_from_slice(pkts);
         Ok(pkts.len())
     }
@@ -1113,7 +1116,7 @@ fn endpoint_connect() -> Result<()> {
             CaseConf::default(),
             Arc::new(AtomicBool::new(false)),
         )),
-        Rc::new(MockSocket::new()),
+        SharedRc::new(MockSocket::new()),
     );
     assert!(e
         .connect(cli_addr, srv_addr, host, None, None, None)
@@ -1140,7 +1143,7 @@ fn endpoint_connect() -> Result<()> {
             CaseConf::default(),
             Arc::new(AtomicBool::new(false)),
         )),
-        Rc::new(MockSocket::new()),
+        SharedRc::new(MockSocket::new()),
     );
     assert!(e
         .connect(cli_addr, srv_addr, host, None, None, None)
@@ -1176,7 +1179,7 @@ fn endpoint_basic_operations() -> Result<()> {
             CaseConf::default(),
             Arc::new(AtomicBool::new(false)),
         )),
-        Rc::new(MockSocket::new()),
+        SharedRc::new(MockSocket::new()),
     );
     let id = "ClientEndpoint";
     e.set_trace_id(String::from(id));
@@ -1191,7 +1194,7 @@ fn endpoint_version_negtiation() -> Result<()> {
     let mut initial_unknown_ver = TEST_INITIAL.clone();
     initial_unknown_ver[1] = 0x73;
 
-    let sock = Rc::new(MockSocket::new());
+    let sock = SharedRc::new(MockSocket::new());
     let mut e = Endpoint::new(
         Box::new(TestPair::new_test_config(true)?),
         true,
@@ -1208,7 +1211,7 @@ fn endpoint_version_negtiation() -> Result<()> {
     e.process_connections()?;
 
     // Server send Version Negoiation
-    let packets = sock.packets.borrow();
+    let packets = shared_borrow(&sock.packets);
     assert!(packets.len() > 0);
 
     let (packet, _) = &packets[0];
@@ -1219,7 +1222,7 @@ fn endpoint_version_negtiation() -> Result<()> {
 
 #[test]
 fn endpoint_stateless_reset_for_restart() -> Result<()> {
-    let new_endpoint = |is_server, conf, sock: Rc<MockSocket>| -> Endpoint {
+    let new_endpoint = |is_server, conf, sock: SharedRc<MockSocket>| -> Endpoint {
         Endpoint::new(
             Box::new(conf),
             is_server,
@@ -1234,14 +1237,14 @@ fn endpoint_stateless_reset_for_restart() -> Result<()> {
     // client endpoint
     let mut client_conf = TestPair::new_test_config(false)?;
     client_conf.enable_stateless_reset(true);
-    let client_sock = Rc::new(MockSocket::new());
+    let client_sock = SharedRc::new(MockSocket::new());
     let mut client = new_endpoint(false, client_conf, client_sock.clone());
 
     // server endpoint
     let mut server_conf = TestPair::new_test_config(true)?;
     server_conf.enable_stateless_reset(true);
     server_conf.set_reset_token_key([1; 64]);
-    let server_sock = Rc::new(MockSocket::new());
+    let server_sock = SharedRc::new(MockSocket::new());
     let mut server = new_endpoint(true, server_conf, server_sock.clone());
 
     // create a connection
@@ -1266,7 +1269,7 @@ fn endpoint_stateless_reset_for_restart() -> Result<()> {
     let mut server_conf = TestPair::new_test_config(true)?;
     server_conf.enable_stateless_reset(true);
     server_conf.set_reset_token_key([1; 64]);
-    let server_sock = Rc::new(MockSocket::new());
+    let server_sock = SharedRc::new(MockSocket::new());
     let mut server = new_endpoint(true, server_conf, server_sock.clone());
     assert_eq!(client.conns.len(), 1);
     assert_eq!(server.conns.len(), 0);
@@ -1304,7 +1307,7 @@ fn endpoint_stateless_reset_for_unknown_packet() -> Result<()> {
     for (is_server, enable_reset, pkt, got_reset) in cases {
         let mut conf = TestPair::new_test_config(is_server)?;
         conf.enable_stateless_reset(enable_reset);
-        let sock = Rc::new(MockSocket::new());
+        let sock = SharedRc::new(MockSocket::new());
         let mut e = Endpoint::new(
             Box::new(conf),
             is_server,
@@ -1322,7 +1325,7 @@ fn endpoint_stateless_reset_for_unknown_packet() -> Result<()> {
 
         // Endpoint send stateless reset
         e.process_connections()?;
-        let packets = sock.packets.borrow();
+        let packets = shared_borrow(&sock.packets);
         if got_reset {
             assert!(packets.len() > 0);
             let (packet, _) = &packets[0];
@@ -1338,7 +1341,7 @@ fn endpoint_stateless_reset_for_unknown_packet() -> Result<()> {
 
 #[test]
 fn endpoint_client_recv_invalid_initial() -> Result<()> {
-    let sock = Rc::new(MockSocket::new());
+    let sock = SharedRc::new(MockSocket::new());
     let mut conf = TestPair::new_test_config(false)?;
     conf.enable_stateless_reset(false);
 
@@ -1373,7 +1376,7 @@ fn endpoint_conn_raw_pointer_stability() -> Result<()> {
             CaseConf::default(),
             Arc::new(AtomicBool::new(false)),
         )),
-        Rc::new(MockSocket::new()),
+        SharedRc::new(MockSocket::new()),
     );
 
     // Insert connection 0

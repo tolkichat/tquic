@@ -16,6 +16,8 @@
 
 use super::*;
 
+use crate::shared_borrow_mut;
+
 impl Connection {
     /// Prepare for sending NEW_CONNECTION_ID/NEW_TOKEN frames.
     pub(super) fn try_schedule_control_frames(&mut self) {
@@ -179,7 +181,7 @@ impl Connection {
 
                     Frame::Crypto { offset, length, .. } => {
                         let level = space.id.to_level();
-                        let mut crypto_streams = self.crypto_streams.borrow_mut();
+                        let mut crypto_streams = shared_borrow_mut(&self.crypto_streams);
                         if let Ok(stream) = crypto_streams.get_mut(level) {
                             stream.send.ack_and_drop(offset, length);
                         }
