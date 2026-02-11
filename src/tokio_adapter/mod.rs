@@ -15,15 +15,15 @@
 //! Tokio async adapter for tquic.
 //!
 //! Provides async/await API bridging tquic's callback-based model
-//! to tokio's async runtime using channels and `LocalSet`.
+//! to tokio's async runtime using `Arc<Mutex>` and poll-based Futures.
 //!
-//! tquic's `Endpoint` and `Connection` use `Rc<RefCell<>>` internally,
-//! making them `!Send`. This adapter confines all tquic objects to a
-//! single-threaded `LocalSet` and exposes `Send`-safe handles via
-//! tokio channels.
+//! With the `tokio-runtime` feature, tquic's `Endpoint` and `Connection`
+//! are `Send + Sync` (using `Arc`/`Mutex` internally). This adapter
+//! wraps them behind `Arc<Mutex<EndpointState>>` and spawns an
+//! `EndpointDriver` Future on a regular tokio task (no `LocalSet`
+//! or dedicated OS thread needed).
 
 mod connection;
-mod driver;
 mod endpoint;
 mod error;
 mod stream;

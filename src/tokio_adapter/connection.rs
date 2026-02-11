@@ -14,19 +14,21 @@
 
 //! Async QUIC connection handle.
 //!
-//! [`TquicConnection`] is a `Send`-safe handle to a QUIC connection
-//! managed by the driver on a `LocalSet`. All operations are forwarded
-//! to the driver via channels.
+//! [`TquicConnection`] directly locks the endpoint state to
+//! perform operations on the underlying tquic `Connection`,
+//! eliminating the channel-based indirection of the old design.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot, watch, Notify};
+use tokio::sync::mpsc;
 
+use super::endpoint::{copy_connection_stats, extract_driver_waker, ConnectionInner};
 use super::error::AsyncError;
-use super::stream::{RecvStream, SendStream, StreamCmd};
+use super::stream::{RecvStream, SendStream};
 use crate::connection::ConnectionStats;
+use crate::Shutdown;
 
 /// Information about why a connection was closed.
 #[derive(Clone, Debug)]
@@ -41,90 +43,92 @@ pub struct ConnectionCloseInfo {
     pub reason: Vec<u8>,
 }
 
-/// Commands sent from the connection handle to the driver.
-pub(crate) enum ConnCmd {
-    /// Open a new bidirectional stream.
-    OpenBi {
-        result_tx: oneshot::Sender<Result<(SendStream, RecvStream), AsyncError>>,
-    },
-    /// Open a new unidirectional stream.
-    OpenUni {
-        result_tx: oneshot::Sender<Result<SendStream, AsyncError>>,
-    },
-    /// Send an unreliable datagram.
-    SendDatagram {
-        data: Bytes,
-        result_tx: oneshot::Sender<Result<(), AsyncError>>,
-    },
-    /// Receive an unreliable datagram.
-    RecvDatagram {
-        result_tx: oneshot::Sender<Result<Bytes, AsyncError>>,
-    },
-    /// Close the connection.
-    Close { error_code: u64, reason: Vec<u8> },
-    /// Retrieve connection statistics.
-    GetStats {
-        result_tx: oneshot::Sender<ConnectionStats>,
-    },
-}
-
-/// A `Send`-safe handle to a QUIC connection.
+/// A `Send + Sync` async QUIC connection handle.
 ///
-/// Operations are forwarded to the driver event loop via channels.
-/// The connection can be used from any tokio task.
+/// Operations directly lock the endpoint state and call tquic
+/// methods, waking the driver afterwards to flush packets.
 pub struct TquicConnection {
-    /// The connection index in the endpoint's connection table.
-    pub(crate) index: u64,
-
-    /// Channel for sending connection-level commands to the driver.
-    pub(crate) cmd_tx: mpsc::Sender<ConnCmd>,
-
-    /// Channel for sending stream-level commands to the driver.
-    pub(crate) stream_cmd_tx: mpsc::Sender<StreamCmd>,
-
-    /// Notified when the handshake completes.
-    pub(crate) established: Arc<Notify>,
-
-    /// Notified when a DATAGRAM frame is received.
-    pub(crate) dgram_readable: Arc<Notify>,
-
-    /// Watch channel receiving close information when connection ends.
-    pub(crate) close_rx: watch::Receiver<Option<ConnectionCloseInfo>>,
+    /// Shared connection state.
+    pub(crate) inner: Arc<ConnectionInner>,
 
     /// Receiver for incoming bidirectional streams.
     pub(crate) incoming_bi_rx: mpsc::Receiver<(SendStream, RecvStream)>,
 
     /// Receiver for incoming unidirectional streams.
     pub(crate) incoming_uni_rx: mpsc::Receiver<RecvStream>,
-
-    /// The remote peer's address.
-    pub(crate) remote_addr: SocketAddr,
 }
 
 impl TquicConnection {
     /// Wait for the QUIC handshake to complete.
-    pub async fn established(&self) {
-        self.established.notified().await;
+    ///
+    /// Returns `Ok(())` when the handshake succeeds, or
+    /// `Err(AsyncError::ConnectionClosed)` if the connection closes
+    /// before the handshake finishes (e.g. TLS failure).
+    pub async fn established(&self) -> Result<(), AsyncError> {
+        loop {
+            // Create notified futures BEFORE checking state to avoid race.
+            let est_notified = self.inner.established_notify.notified();
+            let close_notified = self.inner.close_notify.notified();
+            {
+                let state = self.inner.conn_state.lock().expect("conn_state lock");
+                if state.is_established {
+                    return Ok(());
+                }
+                if state.close_info.is_some() {
+                    return Err(AsyncError::ConnectionClosed);
+                }
+            }
+            tokio::select! {
+                _ = est_notified => {},
+                _ = close_notified => {},
+            }
+        }
     }
 
     /// Open a new bidirectional QUIC stream.
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), AsyncError> {
-        let (result_tx, result_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(ConnCmd::OpenBi { result_tx })
-            .await
-            .map_err(|_| AsyncError::ChannelClosed)?;
-        result_rx.await.map_err(|_| AsyncError::ChannelClosed)?
+        let (stream_id, waker) = {
+            let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
+            let conn = state
+                .endpoint
+                .conn_get_mut(self.inner.index)
+                .ok_or(AsyncError::ConnectionClosed)?;
+            let sid = conn.stream_bidi_new(0, false).map_err(AsyncError::Tquic)?;
+            let w = extract_driver_waker(&state);
+            (sid, w)
+        };
+
+        if let Some(w) = waker {
+            w.wake();
+        }
+
+        let send = SendStream::new(stream_id, self.inner.index, Arc::clone(&self.inner));
+        let recv = RecvStream::new(stream_id, self.inner.index, Arc::clone(&self.inner));
+        Ok((send, recv))
     }
 
     /// Open a new unidirectional QUIC stream.
     pub async fn open_uni(&self) -> Result<SendStream, AsyncError> {
-        let (result_tx, result_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(ConnCmd::OpenUni { result_tx })
-            .await
-            .map_err(|_| AsyncError::ChannelClosed)?;
-        result_rx.await.map_err(|_| AsyncError::ChannelClosed)?
+        let (stream_id, waker) = {
+            let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
+            let conn = state
+                .endpoint
+                .conn_get_mut(self.inner.index)
+                .ok_or(AsyncError::ConnectionClosed)?;
+            let sid = conn.stream_uni_new(0, false).map_err(AsyncError::Tquic)?;
+            let w = extract_driver_waker(&state);
+            (sid, w)
+        };
+
+        if let Some(w) = waker {
+            w.wake();
+        }
+
+        Ok(SendStream::new(
+            stream_id,
+            self.inner.index,
+            Arc::clone(&self.inner),
+        ))
     }
 
     /// Accept an incoming bidirectional stream from the peer.
@@ -143,69 +147,98 @@ impl TquicConnection {
 
     /// Send an unreliable datagram over the connection.
     pub async fn send_datagram(&self, data: Bytes) -> Result<(), AsyncError> {
-        let (result_tx, result_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(ConnCmd::SendDatagram { data, result_tx })
-            .await
-            .map_err(|_| AsyncError::ChannelClosed)?;
-        result_rx.await.map_err(|_| AsyncError::ChannelClosed)?
+        let waker = {
+            let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
+            let conn = state
+                .endpoint
+                .conn_get_mut(self.inner.index)
+                .ok_or(AsyncError::ConnectionClosed)?;
+            conn.dgram_send(data).map_err(AsyncError::Tquic)?;
+            extract_driver_waker(&state)
+        };
+
+        if let Some(w) = waker {
+            w.wake();
+        }
+        Ok(())
     }
 
     /// Receive an unreliable datagram from the connection.
     ///
-    /// Waits for the driver's `on_dgram_readable` notification before
-    /// attempting to read, avoiding busy polling.
+    /// Blocks until a datagram is available via the `dgram_notify` signal.
     pub async fn read_datagram(&self) -> Result<Bytes, AsyncError> {
-        self.dgram_readable.notified().await;
-        let (result_tx, result_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(ConnCmd::RecvDatagram { result_tx })
-            .await
-            .map_err(|_| AsyncError::ChannelClosed)?;
-        result_rx.await.map_err(|_| AsyncError::ChannelClosed)?
+        loop {
+            // Create `Notified` BEFORE checking state to avoid race.
+            let notified = self.inner.dgram_notify.notified();
+            {
+                let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
+                if let Some(conn) = state.endpoint.conn_get_mut(self.inner.index) {
+                    match conn.dgram_recv() {
+                        Ok(data) => return Ok(data),
+                        Err(crate::Error::Done) => {} // No data yet.
+                        Err(e) => return Err(AsyncError::Tquic(e)),
+                    }
+                } else {
+                    return Err(AsyncError::ConnectionClosed);
+                }
+            }
+
+            notified.await;
+        }
     }
 
     /// Close the connection with the given error code and reason.
     pub fn close(&self, error_code: u64, reason: &[u8]) {
-        let _ = self.cmd_tx.try_send(ConnCmd::Close {
-            error_code,
-            reason: reason.to_vec(),
-        });
+        let waker = {
+            let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
+            if let Some(conn) = state.endpoint.conn_get_mut(self.inner.index) {
+                let _ = conn.close(true, error_code, reason);
+            }
+            extract_driver_waker(&state)
+        };
+
+        if let Some(w) = waker {
+            w.wake();
+        }
     }
 
     /// Retrieve connection statistics.
     pub async fn stats(&self) -> Result<ConnectionStats, AsyncError> {
-        let (result_tx, result_rx) = oneshot::channel();
-        self.cmd_tx
-            .send(ConnCmd::GetStats { result_tx })
-            .await
-            .map_err(|_| AsyncError::ChannelClosed)?;
-        result_rx.await.map_err(|_| AsyncError::ChannelClosed)
+        let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
+        let conn = state
+            .endpoint
+            .conn_get_mut(self.inner.index)
+            .ok_or(AsyncError::ConnectionClosed)?;
+        Ok(copy_connection_stats(conn))
     }
 
     /// Return the remote peer's address.
     pub fn remote_addr(&self) -> SocketAddr {
-        self.remote_addr
+        self.inner.remote_addr
     }
 
     /// Check whether the connection has been closed.
     pub fn is_closed(&self) -> bool {
-        self.close_rx.borrow().is_some()
+        self.inner
+            .conn_state
+            .lock()
+            .expect("conn_state lock")
+            .close_info
+            .is_some()
     }
 
     /// Wait until the connection is closed and return close info.
     pub async fn closed(&mut self) -> ConnectionCloseInfo {
         loop {
-            if let Some(info) = self.close_rx.borrow().clone() {
-                return info;
+            // Create `Notified` BEFORE checking state to avoid race.
+            let notified = self.inner.close_notify.notified();
+            {
+                let state = self.inner.conn_state.lock().expect("conn_state lock");
+                if let Some(info) = state.close_info.clone() {
+                    return info;
+                }
             }
-            if self.close_rx.changed().await.is_err() {
-                return ConnectionCloseInfo {
-                    is_app: false,
-                    error_code: 0,
-                    reason: b"channel dropped".to_vec(),
-                };
-            }
+            notified.await;
         }
     }
 }
