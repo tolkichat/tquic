@@ -136,9 +136,22 @@ async fn wait_for_handshake(client: &TquicConnection, server: &TquicConnection) 
 // ---------------------------------------------------------------------------
 
 /// Write all data and signal FIN on a send stream.
-async fn write_and_finish(send: &SendStream, data: &[u8]) -> Result<(), AsyncError> {
-    send.write_all(data).await?;
-    send.finish().await
+///
+/// When built with `tokio-reactor`, uses `finish_with_data` to combine
+/// write + FIN in a single lock cycle, eliminating one extra lock
+/// acquisition and `flush_connection` call.
+///
+/// Accepts [`Bytes`] directly to avoid per-call allocation in hot loops.
+async fn write_and_finish(send: &SendStream, data: Bytes) -> Result<(), AsyncError> {
+    #[cfg(feature = "tokio-reactor")]
+    {
+        send.finish_with_data(data).await
+    }
+    #[cfg(not(feature = "tokio-reactor"))]
+    {
+        send.write_all(&data).await?;
+        send.finish().await
+    }
 }
 
 /// Read all data from a recv stream until FIN using a small stack buffer.
@@ -180,7 +193,7 @@ async fn echo_one_stream(mut server_conn: TquicConnection) {
         .await
         .expect("server accept_bi for echo");
     let data = read_to_end(&srv_recv).await.expect("cold echo read");
-    write_and_finish(&srv_send, &data)
+    write_and_finish(&srv_send, Bytes::from(data))
         .await
         .expect("cold echo write");
 }
@@ -301,9 +314,9 @@ async fn stream_throughput_iter(
 
     let echo_task = tokio::spawn(echo_one_stream(server_conn));
 
-    let payload = vec![0xABu8; payload_size];
+    let payload = Bytes::from(vec![0xABu8; payload_size]);
     let (client_send, client_recv) = client_conn.open_bi().await.expect("open_bi");
-    write_and_finish(&client_send, &payload)
+    write_and_finish(&client_send, payload)
         .await
         .expect("cold bench write");
     let received = read_to_end(&client_recv).await.expect("cold bench read");
@@ -381,7 +394,8 @@ fn bench_warm_for_size(
 ///
 /// Proactively refreshes the connection every [`WARM_CONN_LIFETIME`]
 /// iterations and also on unexpected closure. Reconnection time
-/// is excluded from the returned duration.
+/// is excluded from the returned duration. The payload is allocated
+/// once and reused via cheap `Bytes::clone` (Arc increment).
 #[allow(clippy::too_many_arguments)]
 fn warm_iter_custom(
     rt: &tokio::runtime::Runtime,
@@ -393,6 +407,7 @@ fn warm_iter_custom(
     server_conn: &mut TquicConnection,
     payload_size: usize,
 ) -> Duration {
+    let payload = Bytes::from(vec![0xABu8; payload_size]);
     let mut total = Duration::ZERO;
     let mut done: u64 = 0;
     let mut conn_iter: u64 = 0;
@@ -405,7 +420,7 @@ fn warm_iter_custom(
         }
 
         let start = std::time::Instant::now();
-        let ok = rt.block_on(warm_echo_iter(client_conn, server_conn, payload_size));
+        let ok = rt.block_on(warm_echo_iter(client_conn, server_conn, &payload));
         if ok {
             total += start.elapsed();
             done += 1;
@@ -436,13 +451,14 @@ fn reconnect(
 ///
 /// The client write is spawned so that the server can `accept_bi`
 /// concurrently. The server echoes data back inline, then the
-/// client reads the echo.
+/// client reads the echo. The payload is passed as `&Bytes` so
+/// only a cheap Arc increment is needed per iteration.
 async fn warm_echo_iter(
     client_conn: &TquicConnection,
     server_conn: &mut TquicConnection,
-    payload_size: usize,
+    payload: &Bytes,
 ) -> bool {
-    let payload = vec![0xABu8; payload_size];
+    let payload_len = payload.len();
 
     // Client opens a stream; if connection is closed, signal caller.
     let (client_send, client_recv) = match client_conn.open_bi().await {
@@ -451,8 +467,9 @@ async fn warm_echo_iter(
     };
 
     // Spawn the client write so the server can accept concurrently.
+    let p = payload.clone(); // cheap Arc increment
     let write_task = tokio::spawn(async move {
-        let _ = write_and_finish(&client_send, &payload).await;
+        let _ = write_and_finish(&client_send, p).await;
     });
 
     // Server accepts the peer-initiated stream and echoes data back.
@@ -470,7 +487,10 @@ async fn warm_echo_iter(
             return false;
         }
     };
-    if write_and_finish(&srv_send, &data).await.is_err() {
+    if write_and_finish(&srv_send, Bytes::from(data))
+        .await
+        .is_err()
+    {
         let _ = write_task.await;
         return false;
     }
@@ -482,7 +502,7 @@ async fn warm_echo_iter(
         Err(_) => return false,
     };
     std::hint::black_box(&received);
-    assert_eq!(received.len(), payload_size, "echo size mismatch");
+    assert_eq!(received.len(), payload_len, "echo size mismatch");
     true
 }
 

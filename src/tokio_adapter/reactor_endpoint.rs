@@ -20,6 +20,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use super::cmd::{ConnHandle, ControlCmd, DataCmd};
@@ -51,6 +52,9 @@ pub struct TquicEndpoint {
 
     /// Wake the driver to call `process_connections` / send packets.
     driver_notify: Arc<Notify>,
+
+    /// UDP socket shared with stream handles for unlock-before-send.
+    socket: Arc<UdpSocket>,
 }
 
 impl TquicEndpoint {
@@ -76,6 +80,7 @@ impl TquicEndpoint {
             incoming_conn_rx: channels.incoming_conn_rx,
             shared: channels.shared,
             driver_notify: channels.driver_notify,
+            socket: channels.socket,
         })
     }
 
@@ -108,6 +113,7 @@ impl TquicEndpoint {
             Arc::clone(&self.driver_notify),
             handle.incoming_bi_rx,
             handle.incoming_uni_rx,
+            Arc::clone(&self.socket),
         ))
     }
 
@@ -127,6 +133,7 @@ impl TquicEndpoint {
             Arc::clone(&self.driver_notify),
             handle.incoming_bi_rx,
             handle.incoming_uni_rx,
+            Arc::clone(&self.socket),
         ))
     }
 

@@ -232,6 +232,19 @@ impl Endpoint {
     /// a new connection.
     /// See RFC 9000 Section 5.2 Matching Packets to Connections.
     pub fn recv(&mut self, buf: &mut [u8], info: &PacketInfo) -> Result<()> {
+        let _ = self.recv_with_conn_index(buf, info)?;
+        Ok(())
+    }
+
+    /// Process an incoming UDP datagram and return the affected connection index.
+    ///
+    /// - `Ok(Some(idx))`: packet was routed to or created a connection.
+    /// - `Ok(None)`: packet was ignored, buffered, or handled statelessly.
+    pub fn recv_with_conn_index(
+        &mut self,
+        buf: &mut [u8],
+        info: &PacketInfo,
+    ) -> Result<Option<u64>> {
         trace!(
             "{} recv packet {} bytes {:?}",
             &self.trace_id,
@@ -243,35 +256,38 @@ impl Endpoint {
         let (mut hdr, _) = PacketHeader::from_bytes(buf, cid_len)?;
         let (local, remote) = (info.dst, info.src);
 
-        // Try to delivery the datagram to the target connection.
+        // Try to deliver the datagram to the target connection.
         if let (Some(c), reset) = self.routes.find(&hdr.dcid, buf, info) {
-            return self.recv_existing_conn(*c, reset, buf, info);
+            let idx = *c;
+            self.recv_existing_conn(idx, reset, buf, info)?;
+            return Ok(Some(idx));
         }
 
-        // Drop the datagram for unrecognized connection for client
+        // Drop the datagram for unrecognized connection for client.
         if !self.is_server {
-            return self.recv_unknown_client(&hdr, buf.len(), local, remote);
+            self.recv_unknown_client(&hdr, buf.len(), local, remote)?;
+            return Ok(None);
         }
 
-        // Try to create a new connection for server
+        // Try to create a new connection for server.
         if hdr.pkt_type == PacketType::Initial && !self.closed {
-            return self.recv_server_initial(&mut hdr, buf, info, local, remote);
+            return self.recv_server_initial_idx(&mut hdr, buf, info, local, remote);
         }
 
-        // Try to buffer ZeroRTT packets for the unknown connection on the server
+        // Try to buffer ZeroRTT packets for the unknown connection on the server.
         if hdr.pkt_type == PacketType::ZeroRTT && !self.closed {
             self.buffer.add(hdr.dcid, buf.to_vec(), *info);
+            return Ok(None);
         }
 
-        // Send the Stateless Reset packet for the unknown connection
+        // Send the Stateless Reset packet for the unknown connection.
         if hdr.pkt_type == PacketType::OneRTT && !hdr.dcid.is_empty() && self.config.stateless_reset
         {
             self.send_stateless_reset(buf.len(), &hdr.dcid, local, remote)?;
-            return Ok(());
         }
 
-        // Ignore non-initial packet for unknown connection
-        Ok(())
+        // Ignore non-initial packet for unknown connection.
+        Ok(None)
     }
 
     /// Deliver a datagram to an existing connection.
@@ -322,23 +338,36 @@ impl Endpoint {
         local: SocketAddr,
         remote: SocketAddr,
     ) -> Result<()> {
+        let _ = self.recv_server_initial_idx(hdr, buf, info, local, remote)?;
+        Ok(())
+    }
+
+    /// Handle an Initial packet and return the new connection index.
+    ///
+    /// Returns `Ok(Some(idx))` when a connection was created, `Ok(None)` when
+    /// the packet was rejected (max connections reached, version mismatch).
+    fn recv_server_initial_idx(
+        &mut self,
+        hdr: &mut PacketHeader,
+        buf: &mut [u8],
+        info: &PacketInfo,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Result<Option<u64>> {
         if self.conns.len() >= self.config.max_concurrent_conns as usize {
-            return Ok(());
+            return Ok(None);
         }
         if !crate::version_is_supported(hdr.version) {
-            return self.send_version_negotiation(hdr, local, remote);
+            self.send_version_negotiation(hdr, local, remote)?;
+            return Ok(None);
         }
 
         let token = self.validate_initial_token(hdr, local, remote)?;
-        let odcid = match token {
-            Some(ref token) => token.odcid.unwrap(), // always success
-            None => hdr.dcid,
-        };
 
         let idx = self.create_server_conn(hdr, token.as_ref(), local, remote)?;
         self.deliver_initial_to_conn(idx, hdr, buf, info)?;
 
-        Ok(())
+        Ok(Some(idx))
     }
 
     /// Validate the address token in an Initial packet.
@@ -915,6 +944,143 @@ impl Endpoint {
                 } else {
                     self.timers.del(idx);
                 }
+            }
+        }
+    }
+
+    /// Mark a specific connection as tickable (needing processing).
+    ///
+    /// No-op if the connection does not exist.
+    pub fn mark_connection_tickable(&mut self, conn_index: u64) {
+        if let Some(conn) = self.conns.get_mut(conn_index) {
+            conn.mark_tickable(true);
+        }
+    }
+
+    /// Process a single connection: events, readable/writable callbacks,
+    /// packet generation, and UDP send.
+    ///
+    /// This is a lightweight alternative to `process_connections()` when
+    /// only one connection needs work (e.g., after receiving a packet
+    /// for a specific connection).
+    ///
+    /// Returns `Ok(packets_sent)` on success.
+    pub fn process_single_connection(&mut self, conn_index: u64) -> Result<usize> {
+        self.mark_connection_tickable(conn_index);
+
+        let mut ready = Vec::<u64>::new();
+        let alive = self.process_connection(conn_index, &mut ready);
+        if !alive {
+            self.cleanup_closed_conn(conn_index);
+            return Ok(0);
+        }
+
+        let total = match self.flush_connection(conn_index) {
+            Ok(n) => n,
+            Err(Error::Done) => 0,
+            Err(e) => return Err(e),
+        };
+
+        for idx in ready {
+            if let Some(conn) = self.conns.get_mut(idx) {
+                conn.mark_tickable(true);
+            }
+        }
+
+        Ok(total)
+    }
+
+    /// Generate pending packets for a connection and return them.
+    ///
+    /// Unlike [`flush_connection`](Self::flush_connection), this does
+    /// **not** send packets via UDP. It generates them into the
+    /// internal queue, drains them, and returns owned copies. The
+    /// caller is responsible for sending via UDP **outside** any lock
+    /// that protects the endpoint.
+    ///
+    /// Returns an empty `Vec` when the connection is not found,
+    /// is draining/closed, or had nothing to send.
+    pub fn generate_and_take_packets(&mut self, conn_index: u64) -> Vec<(Vec<u8>, PacketInfo)> {
+        if Self::generate_conn_packets(&mut self.conns, &mut self.packets, conn_index).is_err() {
+            return Vec::new();
+        }
+        Self::refresh_conn_timer(&mut self.conns, &mut self.timers, conn_index);
+        self.take_all_packets()
+    }
+
+    /// Drain all pending packets from the queue and return them.
+    fn take_all_packets(&mut self) -> Vec<(Vec<u8>, PacketInfo)> {
+        self.packets.drain_all()
+    }
+
+    /// Flush pending packets for a single connection.
+    ///
+    /// Generates and sends outgoing packets for the specified connection
+    /// only, bypassing the batch `process_connections()` pipeline.
+    /// Designed for low-latency stream writes where the caller already
+    /// wrote data via `stream_write()`.
+    ///
+    /// Returns the number of packets sent, or `Error::Done` if the
+    /// connection was not found, is draining/closed, or had nothing
+    /// to send.
+    pub fn flush_connection(&mut self, conn_index: u64) -> Result<usize> {
+        // Generate packets — borrow `conns` and `packets` as disjoint fields.
+        Self::generate_conn_packets(&mut self.conns, &mut self.packets, conn_index)?;
+
+        // Send all generated packets via UDP.
+        let total = self.flush_remaining()?;
+
+        // Refresh the connection's timer after sending.
+        Self::refresh_conn_timer(&mut self.conns, &mut self.timers, conn_index);
+
+        if total > 0 {
+            Ok(total)
+        } else {
+            Err(Error::Done)
+        }
+    }
+
+    /// Generate outgoing packets from a single connection's send buffers.
+    ///
+    /// Takes disjoint borrows of `conns` and `packets` to satisfy the
+    /// borrow checker — the connection and the packet queue are separate
+    /// fields of `Endpoint`.
+    fn generate_conn_packets(
+        conns: &mut ConnectionTable,
+        packets: &mut PacketQueue,
+        conn_index: u64,
+    ) -> Result<()> {
+        let conn = match conns.get_mut(conn_index) {
+            Some(c) if !c.is_draining() && !c.is_closed() => c,
+            _ => return Err(Error::Done),
+        };
+        loop {
+            let mut buf = packets.get_buffer();
+            match conn.send(&mut buf) {
+                Ok((len, info)) => {
+                    buf.truncate(len);
+                    packets.add_packet(buf, info);
+                }
+                Err(Error::Done) => {
+                    packets.put_buffer(buf);
+                    break;
+                }
+                Err(e) => {
+                    packets.put_buffer(buf);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Refresh the timer for a single connection after sending packets.
+    fn refresh_conn_timer(conns: &mut ConnectionTable, timers: &mut TimerQueue, conn_index: u64) {
+        if let Some(conn) = conns.get_mut(conn_index) {
+            if let Some(t) = conn.timeout() {
+                timers.add(conn_index, t, Instant::now());
+            } else {
+                timers.del(&conn_index);
             }
         }
     }

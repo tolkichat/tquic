@@ -87,6 +87,7 @@ quinn = { version = "0.11", default-features = false, features = ["rustls-ring",
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 s2n-quic = { version = "1", features = ["provider-tls-rustls"] }
+iroh-quinn = { version = "0.16", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
 
 [build-dependencies]
 cmake = "0.1"
@@ -112,4 +113,12 @@ harness = false
 
 [[bench]]
 name = "s2n_quic_comparison"
+harness = false
+
+[[bench]]
+name = "thin_wrapper"
+harness = false
+
+[[bench]]
+name = "iroh_quinn_comparison"
 harness = false

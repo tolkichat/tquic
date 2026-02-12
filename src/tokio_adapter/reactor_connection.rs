@@ -22,6 +22,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use super::cmd::{ControlCmd, DataCmd, IncomingBiStream, IncomingUniStream, SharedConnState};
@@ -75,6 +76,9 @@ pub struct TquicConnection {
 
     /// Receiver for incoming unidirectional streams from the peer.
     incoming_uni_rx: mpsc::Receiver<IncomingUniStream>,
+
+    /// UDP socket for unlock-before-send in stream handles.
+    socket: Arc<UdpSocket>,
 }
 
 impl TquicConnection {
@@ -90,6 +94,7 @@ impl TquicConnection {
         driver_notify: Arc<Notify>,
         incoming_bi_rx: mpsc::Receiver<IncomingBiStream>,
         incoming_uni_rx: mpsc::Receiver<IncomingUniStream>,
+        socket: Arc<UdpSocket>,
     ) -> Self {
         Self {
             conn_index,
@@ -101,6 +106,7 @@ impl TquicConnection {
             driver_notify,
             incoming_bi_rx,
             incoming_uni_rx,
+            socket,
         }
     }
 
@@ -149,6 +155,7 @@ impl TquicConnection {
             self.shared_inner.clone(),
             Arc::clone(&self.driver_notify),
             self.data_tx.clone(),
+            Arc::clone(&self.socket),
         );
         let recv = RecvStream::new(
             result.recv_id,
@@ -156,6 +163,7 @@ impl TquicConnection {
             self.shared_inner.clone(),
             Arc::clone(&self.driver_notify),
             self.data_tx.clone(),
+            Arc::clone(&self.socket),
         );
         Ok((send, recv))
     }
@@ -178,6 +186,7 @@ impl TquicConnection {
             self.shared_inner.clone(),
             Arc::clone(&self.driver_notify),
             self.data_tx.clone(),
+            Arc::clone(&self.socket),
         ))
     }
 
@@ -192,6 +201,7 @@ impl TquicConnection {
             self.shared_inner.clone(),
             Arc::clone(&self.driver_notify),
             self.data_tx.clone(),
+            Arc::clone(&self.socket),
         );
         let recv = RecvStream::new(
             incoming.recv_id,
@@ -199,6 +209,7 @@ impl TquicConnection {
             self.shared_inner.clone(),
             Arc::clone(&self.driver_notify),
             self.data_tx.clone(),
+            Arc::clone(&self.socket),
         );
         Some((send, recv))
     }
@@ -214,6 +225,7 @@ impl TquicConnection {
             self.shared_inner.clone(),
             Arc::clone(&self.driver_notify),
             self.data_tx.clone(),
+            Arc::clone(&self.socket),
         ))
     }
 

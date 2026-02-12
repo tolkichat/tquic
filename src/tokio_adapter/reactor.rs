@@ -92,6 +92,12 @@ pub(crate) struct CloseInfo {
 // UdpSender
 // ---------------------------------------------------------------------------
 
+/// Maximum packets per `sendmmsg` call.
+///
+/// Linux `UIO_MAXIOV` is 1024, but 64 is a practical limit that
+/// keeps stack allocations bounded while still amortising syscall cost.
+const SENDMMSG_BATCH: usize = 64;
+
 /// Sends outgoing packets via a tokio UdpSocket.
 struct UdpSender {
     socket: Arc<UdpSocket>,
@@ -99,6 +105,23 @@ struct UdpSender {
 
 impl PacketSendHandler for UdpSender {
     fn on_packets_send(&self, pkts: &[(Vec<u8>, PacketInfo)]) -> crate::Result<usize> {
+        if pkts.is_empty() {
+            return Ok(0);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.send_mmsg(pkts)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.send_per_packet(pkts)
+        }
+    }
+}
+
+impl UdpSender {
+    /// Fallback: send each packet individually via `try_send_to`.
+    fn send_per_packet(&self, pkts: &[(Vec<u8>, PacketInfo)]) -> crate::Result<usize> {
         let mut sent = 0;
         for (data, info) in pkts {
             match self.socket.try_send_to(data, info.dst) {
@@ -111,6 +134,172 @@ impl PacketSendHandler for UdpSender {
             }
         }
         Ok(sent)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sendmmsg batched path (Linux only)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod sendmmsg_impl {
+    use super::*;
+    use std::os::unix::io::AsRawFd;
+
+    impl UdpSender {
+        /// Batch-send packets via `libc::sendmmsg`.
+        ///
+        /// Falls back to per-packet sending if `sendmmsg` returns an
+        /// error on the very first call (e.g. unsupported kernel).
+        pub(super) fn send_mmsg(&self, pkts: &[(Vec<u8>, PacketInfo)]) -> crate::Result<usize> {
+            let mut total_sent: usize = 0;
+
+            for chunk in pkts.chunks(SENDMMSG_BATCH) {
+                let n = self.send_mmsg_batch(chunk)?;
+                total_sent += n;
+                if n < chunk.len() {
+                    break; // Socket would block; stop sending.
+                }
+            }
+
+            Ok(total_sent)
+        }
+
+        /// Send a single batch (up to `SENDMMSG_BATCH` packets).
+        fn send_mmsg_batch(&self, pkts: &[(Vec<u8>, PacketInfo)]) -> crate::Result<usize> {
+            let count = pkts.len();
+            let mut addrs = Vec::with_capacity(count);
+            let mut iovecs = Vec::with_capacity(count);
+            let mut hdrs = Vec::with_capacity(count);
+
+            for (data, info) in pkts {
+                addrs.push(sockaddr_from_std(info.dst));
+
+                iovecs.push(libc::iovec {
+                    iov_base: data.as_ptr() as *mut libc::c_void,
+                    iov_len: data.len(),
+                });
+            }
+
+            for i in 0..count {
+                let (ref storage, addrlen) = addrs[i];
+                hdrs.push(libc::mmsghdr {
+                    msg_hdr: libc::msghdr {
+                        msg_name: storage as *const libc::sockaddr_storage as *mut libc::c_void,
+                        msg_namelen: addrlen,
+                        msg_iov: &mut iovecs[i] as *mut libc::iovec,
+                        msg_iovlen: 1,
+                        msg_control: std::ptr::null_mut(),
+                        msg_controllen: 0,
+                        msg_flags: 0,
+                    },
+                    msg_len: 0,
+                });
+            }
+
+            let fd = self.raw_fd();
+            let sent = call_sendmmsg(fd, &mut hdrs)?;
+            Ok(sent)
+        }
+
+        /// Extract the raw file descriptor from the tokio `UdpSocket`.
+        fn raw_fd(&self) -> libc::c_int {
+            self.socket.as_ref().as_raw_fd()
+        }
+    }
+
+    /// Invoke `libc::sendmmsg` and translate the result.
+    fn call_sendmmsg(fd: libc::c_int, hdrs: &mut [libc::mmsghdr]) -> crate::Result<usize> {
+        // SAFETY: `hdrs` is a valid, initialised array of `mmsghdr`.
+        // Each `msg_hdr.msg_iov` points to a valid `iovec` whose
+        // `iov_base` is borrowed from the packet `Vec<u8>` kept alive
+        // by the caller. `msg_name` points to a `sockaddr_storage`
+        // also kept alive in `addrs`. The file descriptor is a valid,
+        // non-blocking UDP socket owned by tokio. `MSG_DONTWAIT`
+        // ensures we never block the event loop.
+        let ret = unsafe {
+            libc::sendmmsg(
+                fd,
+                hdrs.as_mut_ptr(),
+                hdrs.len() as libc::c_uint,
+                libc::MSG_DONTWAIT,
+            )
+        };
+
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(0);
+            }
+            warn!("sendmmsg error: {err}");
+            return Ok(0);
+        }
+        Ok(ret as usize)
+    }
+
+    /// Convert a `std::net::SocketAddr` to a `(sockaddr_storage, socklen_t)`.
+    fn sockaddr_from_std(addr: std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+
+        match addr {
+            std::net::SocketAddr::V4(v4) => {
+                let sin = sockaddr_in_from_v4(v4);
+                // SAFETY: `sockaddr_in` is smaller than `sockaddr_storage`
+                // and both are POD types with compatible alignment.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &sin as *const libc::sockaddr_in as *const u8,
+                        &mut storage as *mut libc::sockaddr_storage as *mut u8,
+                        std::mem::size_of::<libc::sockaddr_in>(),
+                    );
+                }
+                (
+                    storage,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+            std::net::SocketAddr::V6(v6) => {
+                let sin6 = sockaddr_in6_from_v6(v6);
+                // SAFETY: `sockaddr_in6` is smaller than `sockaddr_storage`
+                // and both are POD types with compatible alignment.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &sin6 as *const libc::sockaddr_in6 as *const u8,
+                        &mut storage as *mut libc::sockaddr_storage as *mut u8,
+                        std::mem::size_of::<libc::sockaddr_in6>(),
+                    );
+                }
+                (
+                    storage,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    }
+
+    /// Build a `libc::sockaddr_in` from a `SocketAddrV4`.
+    fn sockaddr_in_from_v4(v4: std::net::SocketAddrV4) -> libc::sockaddr_in {
+        libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: v4.port().to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes(v4.ip().octets()),
+            },
+            sin_zero: [0; 8],
+        }
+    }
+
+    /// Build a `libc::sockaddr_in6` from a `SocketAddrV6`.
+    fn sockaddr_in6_from_v6(v6: std::net::SocketAddrV6) -> libc::sockaddr_in6 {
+        libc::sockaddr_in6 {
+            sin6_family: libc::AF_INET6 as libc::sa_family_t,
+            sin6_port: v6.port().to_be(),
+            sin6_flowinfo: v6.flowinfo(),
+            sin6_addr: libc::in6_addr {
+                s6_addr: v6.ip().octets(),
+            },
+            sin6_scope_id: v6.scope_id(),
+        }
     }
 }
 
@@ -163,6 +352,8 @@ pub(crate) struct ReactorChannels {
     pub(crate) shared: SharedState,
     /// Notify handle: stream handles wake the driver after writes.
     pub(crate) driver_notify: Arc<Notify>,
+    /// UDP socket shared with stream handles for unlock-before-send.
+    pub(crate) socket: Arc<UdpSocket>,
 }
 
 impl Reactor {
@@ -195,6 +386,8 @@ impl Reactor {
         let shared: SharedState = Arc::new(std::sync::Mutex::new(SharedInner::new(endpoint)));
         let driver_notify = Arc::new(Notify::new());
 
+        let channels_socket = Arc::clone(&socket);
+
         let reactor = Self {
             shared: Arc::clone(&shared),
             socket,
@@ -216,6 +409,7 @@ impl Reactor {
             incoming_conn_rx,
             shared,
             driver_notify,
+            socket: channels_socket,
         };
 
         Ok((reactor, channels))
@@ -264,10 +458,10 @@ impl Reactor {
                 }
 
                 () = self.driver_notify.notified() => {
-                    // Stream handles already wrote data via Mutex.
-                    // Driver just needs to call process_connections
-                    // to generate/send packets.
-                    self.process_and_dispatch();
+                    // Stream handles already wrote data + flushed packets
+                    // via Mutex. Only drain any handler events generated
+                    // during the inline flush.
+                    self.drain_handler_events();
                 }
 
                 Some(cmd) = self.data_rx.recv() => {
@@ -302,15 +496,14 @@ impl Reactor {
 
     /// Process a single UDP recv result.
     fn handle_udp_recv(&mut self, result: Result<(usize, SocketAddr), std::io::Error>) {
-        if let Ok((n, src)) = result {
-            let info = PacketInfo {
-                src,
-                dst: self.local_addr,
-                time: Instant::now(),
-            };
-            let mut inner = self.shared.lock().expect("shared state poisoned");
-            let _ = inner.endpoint.recv(&mut self.recv_buf[..n], &info);
-        }
+        let Ok((n, src)) = result else { return };
+        let info = PacketInfo {
+            src,
+            dst: self.local_addr,
+            time: Instant::now(),
+        };
+        let mut inner = self.shared.lock().expect("shared state poisoned");
+        let _ = inner.endpoint.recv(&mut self.recv_buf[..n], &info);
     }
 
     /// Drain additional data commands without yielding.

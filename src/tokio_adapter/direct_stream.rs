@@ -25,12 +25,14 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use bytes::Bytes;
+use log::warn;
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
 
 use super::cmd::DataCmd;
 use super::error::AsyncError;
 use super::shared::SharedState;
-use crate::Shutdown;
+use crate::{PacketInfo, Shutdown};
 
 // ---------------------------------------------------------------------------
 // SendStream
@@ -58,6 +60,9 @@ pub struct SendStream {
 
     /// Suppresses `RESET_STREAM` on drop after [`finish`](Self::finish).
     finished: AtomicBool,
+
+    /// UDP socket for unlock-before-send packet dispatch.
+    socket: Arc<UdpSocket>,
 }
 
 impl SendStream {
@@ -68,6 +73,7 @@ impl SendStream {
         shared: SharedState,
         driver_notify: Arc<Notify>,
         data_tx: mpsc::Sender<DataCmd>,
+        socket: Arc<UdpSocket>,
     ) -> Self {
         Self {
             stream_id,
@@ -76,6 +82,7 @@ impl SendStream {
             driver_notify,
             data_tx,
             finished: AtomicBool::new(false),
+            socket,
         }
     }
 
@@ -158,20 +165,25 @@ impl SendStream {
 
     // -- private helpers ----------------------------------------------------
 
-    /// Core write: lock Mutex, call `stream_write`, wake driver on success.
+    /// Core write: lock Mutex, call `stream_write`, flush via driver.
+    ///
+    /// Uses `flush_connection` which sends packets through the
+    /// `PacketSendHandler` (zero-copy), then wakes the driver.
     ///
     /// Returns `Poll::Pending` when flow-control blocks (`Error::Done`),
     /// registering the task's waker for later notification.
     async fn write_bytes_inner(&self, data: Bytes, fin: bool) -> Result<usize, AsyncError> {
         poll_fn(|cx| {
             let mut inner = self.shared.lock().expect("shared state poisoned");
-            let conn = match inner.endpoint.conn_get_mut(self.conn_index) {
-                Some(c) => c,
+            let write_result = match inner.endpoint.conn_get_mut(self.conn_index) {
+                Some(conn) => conn.stream_write(self.stream_id, data.clone(), fin),
                 None => return Poll::Ready(Err(AsyncError::ConnectionClosed)),
             };
-            match conn.stream_write(self.stream_id, data.clone(), fin) {
+            match write_result {
                 Ok(n) => {
+                    let pkts = inner.endpoint.generate_and_take_packets(self.conn_index);
                     drop(inner);
+                    send_packets_unlocked(&self.socket, &pkts);
                     self.driver_notify.notify_one();
                     Poll::Ready(Ok(n))
                 }
@@ -187,8 +199,9 @@ impl SendStream {
 
     /// Batch write all data in a single lock cycle.
     ///
-    /// Holds the lock and drains as much as flow control allows,
-    /// notifying the driver only once after draining (not per chunk).
+    /// Holds the lock and drains as much as flow control allows.
+    /// Generates and takes packets inside the lock, then sends them
+    /// after dropping the lock (unlock-before-send).
     async fn write_all_inner(&self, data: Bytes, fin: bool) -> Result<(), AsyncError> {
         if data.is_empty() && !fin {
             return Ok(());
@@ -196,31 +209,31 @@ impl SendStream {
         let mut remaining = data;
         poll_fn(|cx| {
             let mut inner = self.shared.lock().expect("shared state poisoned");
-            let conn = match inner.endpoint.conn_get_mut(self.conn_index) {
-                Some(c) => c,
-                None => return Poll::Ready(Err(AsyncError::ConnectionClosed)),
-            };
-            // Drain as much as flow control allows in one lock
             loop {
-                match conn.stream_write(self.stream_id, remaining.clone(), fin) {
+                let write_result = match inner.endpoint.conn_get_mut(self.conn_index) {
+                    Some(conn) => conn.stream_write(self.stream_id, remaining.clone(), fin),
+                    None => return Poll::Ready(Err(AsyncError::ConnectionClosed)),
+                };
+                match write_result {
                     Ok(n) if n >= remaining.len() => {
-                        // All data consumed
+                        let pkts = inner.endpoint.generate_and_take_packets(self.conn_index);
                         drop(inner);
+                        send_packets_unlocked(&self.socket, &pkts);
                         self.driver_notify.notify_one();
                         return Poll::Ready(Ok(()));
                     }
                     Ok(n) => {
-                        // Partial write — continue without releasing lock
                         remaining = remaining.slice(n..);
                     }
                     Err(crate::Error::Done) => {
-                        // Flow control blocked — flush what we wrote so far
+                        let pkts = inner.endpoint.generate_and_take_packets(self.conn_index);
                         inner.register_write_waker(
                             self.conn_index,
                             self.stream_id,
                             cx.waker().clone(),
                         );
                         drop(inner);
+                        send_packets_unlocked(&self.socket, &pkts);
                         self.driver_notify.notify_one();
                         return Poll::Pending;
                     }
@@ -285,6 +298,9 @@ pub struct RecvStream {
 
     /// Data channel for shutdown commands (fire-and-forget on drop).
     data_tx: mpsc::Sender<DataCmd>,
+
+    /// UDP socket for unlock-before-send packet dispatch.
+    socket: Arc<UdpSocket>,
 }
 
 impl RecvStream {
@@ -295,6 +311,7 @@ impl RecvStream {
         shared: SharedState,
         driver_notify: Arc<Notify>,
         data_tx: mpsc::Sender<DataCmd>,
+        socket: Arc<UdpSocket>,
     ) -> Self {
         Self {
             stream_id,
@@ -302,6 +319,7 @@ impl RecvStream {
             shared,
             driver_notify,
             data_tx,
+            socket,
         }
     }
 
@@ -334,25 +352,36 @@ impl RecvStream {
     // -- private helpers ----------------------------------------------------
 
     /// Core read poll: lock Mutex, call `stream_read`, handle results.
+    ///
+    /// After a successful read, flushes flow-control frames
+    /// (`MAX_STREAM_DATA` / `MAX_DATA`) via the `PacketSendHandler`
+    /// (zero-copy) so the sender gets credit without waiting for
+    /// a driver reactor round-trip.
     fn poll_read(
         &self,
         buf: &mut [u8],
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<Option<usize>, AsyncError>> {
         let mut inner = self.shared.lock().expect("shared state poisoned");
-        let conn = match inner.endpoint.conn_get_mut(self.conn_index) {
-            Some(c) => c,
+        let read_result = match inner.endpoint.conn_get_mut(self.conn_index) {
+            Some(conn) => conn.stream_read(self.stream_id, buf),
             None => return Poll::Ready(Err(AsyncError::ConnectionClosed)),
         };
-        match conn.stream_read(self.stream_id, buf) {
+        match read_result {
             Ok((0, true)) => Poll::Ready(Ok(None)),
             Ok((n, _fin)) => {
+                let pkts = inner.endpoint.generate_and_take_packets(self.conn_index);
                 drop(inner);
+                send_packets_unlocked(&self.socket, &pkts);
                 self.driver_notify.notify_one();
                 Poll::Ready(Ok(Some(n)))
             }
             Err(crate::Error::Done) => {
-                if conn.stream_finished(self.stream_id) {
+                let finished = inner
+                    .endpoint
+                    .conn_get_mut(self.conn_index)
+                    .map_or(true, |c| c.stream_finished(self.stream_id));
+                if finished {
                     Poll::Ready(Ok(None))
                 } else {
                     inner.register_read_waker(self.conn_index, self.stream_id, cx.waker().clone());
@@ -364,64 +393,68 @@ impl RecvStream {
         }
     }
 
+    /// Generate packets inside the lock, then send outside (zero-copy).
+    ///
+    /// Returns `Some(total)` when bytes were read, or `None` on FIN
+    /// with no data.
+    fn flush_and_return(
+        &self,
+        mut inner: std::sync::MutexGuard<'_, super::shared::SharedInner>,
+        total: usize,
+    ) -> Poll<Result<Option<usize>, AsyncError>> {
+        let pkts = inner.endpoint.generate_and_take_packets(self.conn_index);
+        drop(inner);
+        send_packets_unlocked(&self.socket, &pkts);
+        self.driver_notify.notify_one();
+        if total == 0 {
+            Poll::Ready(Ok(None))
+        } else {
+            Poll::Ready(Ok(Some(total)))
+        }
+    }
+
     /// Batch read: lock once, drain all available data into buf.
+    ///
+    /// After draining, flushes flow-control frames so the sender
+    /// gets `MAX_STREAM_DATA` credits without a reactor round-trip.
     fn poll_read_chunk(
         &self,
         buf: &mut [u8],
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<Option<usize>, AsyncError>> {
         let mut inner = self.shared.lock().expect("shared state poisoned");
-        let conn = match inner.endpoint.conn_get_mut(self.conn_index) {
-            Some(c) => c,
-            None => return Poll::Ready(Err(AsyncError::ConnectionClosed)),
-        };
         let mut total = 0;
         loop {
-            match conn.stream_read(self.stream_id, &mut buf[total..]) {
-                Ok((0, true)) => {
-                    if total > 0 {
-                        drop(inner);
-                        self.driver_notify.notify_one();
-                        return Poll::Ready(Ok(Some(total)));
-                    }
-                    return Poll::Ready(Ok(None));
-                }
+            let read_result = match inner.endpoint.conn_get_mut(self.conn_index) {
+                Some(conn) => conn.stream_read(self.stream_id, &mut buf[total..]),
+                None => return Poll::Ready(Err(AsyncError::ConnectionClosed)),
+            };
+            match read_result {
+                Ok((0, true)) => return self.flush_and_return(inner, total),
                 Ok((n, fin)) => {
                     total += n;
                     if fin || total >= buf.len() {
-                        drop(inner);
-                        self.driver_notify.notify_one();
-                        if total == 0 && fin {
-                            return Poll::Ready(Ok(None));
-                        }
-                        return Poll::Ready(Ok(Some(total)));
+                        return self.flush_and_return(inner, total);
                     }
-                    // Continue reading within same lock
+                }
+                Err(crate::Error::Done) if total > 0 => {
+                    return self.flush_and_return(inner, total);
                 }
                 Err(crate::Error::Done) => {
-                    if total > 0 {
-                        drop(inner);
-                        self.driver_notify.notify_one();
-                        return Poll::Ready(Ok(Some(total)));
-                    }
-                    if conn.stream_finished(self.stream_id) {
+                    let finished = inner
+                        .endpoint
+                        .conn_get_mut(self.conn_index)
+                        .map_or(true, |c| c.stream_finished(self.stream_id));
+                    if finished {
                         return Poll::Ready(Ok(None));
                     }
-                    inner.register_read_waker(
-                        self.conn_index,
-                        self.stream_id,
-                        cx.waker().clone(),
-                    );
+                    inner.register_read_waker(self.conn_index, self.stream_id, cx.waker().clone());
                     return Poll::Pending;
                 }
-                Err(crate::Error::StreamStateError) => {
-                    if total > 0 {
-                        drop(inner);
-                        self.driver_notify.notify_one();
-                        return Poll::Ready(Ok(Some(total)));
-                    }
-                    return Poll::Ready(Ok(None));
+                Err(crate::Error::StreamStateError) if total > 0 => {
+                    return self.flush_and_return(inner, total);
                 }
+                Err(crate::Error::StreamStateError) => return Poll::Ready(Ok(None)),
                 Err(e) => return Poll::Ready(Err(AsyncError::Tquic(e))),
             }
         }
@@ -441,5 +474,26 @@ impl Drop for RecvStream {
             direction: Shutdown::Read,
             error_code: 0,
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Out-of-lock UDP sender
+// ---------------------------------------------------------------------------
+
+/// Send pre-generated packets via UDP, outside any Mutex.
+///
+/// Uses non-blocking `try_send_to`; silently stops on `WouldBlock`
+/// or any I/O error (the driver will retry on the next tick).
+fn send_packets_unlocked(socket: &UdpSocket, packets: &[(Vec<u8>, PacketInfo)]) {
+    for (data, info) in packets {
+        match socket.try_send_to(data, info.dst) {
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                warn!("out-of-lock UDP send error: {e}");
+                break;
+            }
+        }
     }
 }

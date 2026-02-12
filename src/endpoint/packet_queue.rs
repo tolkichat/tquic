@@ -75,6 +75,16 @@ impl PacketQueue {
         }
     }
 
+    /// Drain all packets from the queue, returning ownership.
+    ///
+    /// Unlike [`drain_front`](Self::drain_front), this does **not** return
+    /// buffers to the pool. Callers are responsible for the taken buffers
+    /// (typically sent via UDP and dropped). The pool regenerates
+    /// organically on subsequent sends.
+    pub(crate) fn drain_all(&mut self) -> Vec<(Vec<u8>, PacketInfo)> {
+        self.packets.drain(..).collect()
+    }
+
     /// Get a packet buffer from the buffer pool.
     pub(crate) fn get_buffer(&mut self) -> Vec<u8> {
         match self.buffers.pop_front() {
