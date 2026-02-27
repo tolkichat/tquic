@@ -309,10 +309,9 @@ impl Connection {
         // Update statistic metrics
         self.stats.recv_count += 1;
         self.stats.recv_bytes += read as u64;
-        self.paths
-            .get_mut(pid)?
-            .recovery
-            .stat_recv_event(1, read as u64);
+        let path = self.paths.get_mut(pid)?;
+        path.last_recv_time = now;
+        path.recovery.stat_recv_event(1, read as u64);
 
         // The successful use of Handshake packets indicates that no more
         // Initial packets need to be exchanged, as these keys can only be

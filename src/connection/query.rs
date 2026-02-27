@@ -256,6 +256,15 @@ impl Connection {
 
                 Timer::KeepAlive => {
                     let _ = self.paths.mark_ping(None);
+                    // GC stale paths based on path_timeout_ms.
+                    let timeout_ms = self.multipath_conf.path_timeout_ms;
+                    let abandoned = self.paths.abandon_stale_paths(now, timeout_ms);
+                    if abandoned > 0 {
+                        debug!(
+                            "{} abandoned {} stale paths (timeout={}ms)",
+                            self.trace_id, abandoned, timeout_ms
+                        );
+                    }
                 }
 
                 Timer::PathChallenge => self.paths.on_path_chal_timeout(now),

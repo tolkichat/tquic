@@ -109,6 +109,9 @@ pub struct Path {
 
     /// Whether the path has been abandoned in MPQUIC mode.
     pub(super) is_abandon: bool,
+
+    /// Last time a packet was received on this path.
+    pub(super) last_recv_time: time::Instant,
 }
 
 impl Path {
@@ -154,6 +157,7 @@ impl Path {
             trace_id: trace_id.to_string(),
             space_id: SpaceId::Data,
             is_abandon: false,
+            last_recv_time: time::Instant::now(),
         }
     }
 
@@ -674,6 +678,31 @@ impl PathMap {
         Ok(())
     }
 
+    /// Mark paths as abandoned if they haven't received data within the timeout.
+    ///
+    /// Never abandons the active path. If `timeout_ms` is 0, the feature is
+    /// disabled and no paths are touched.
+    ///
+    /// Returns the count of newly abandoned paths.
+    pub fn abandon_stale_paths(&mut self, now: time::Instant, timeout_ms: u64) -> usize {
+        if timeout_ms == 0 {
+            return 0;
+        }
+        let timeout = time::Duration::from_millis(timeout_ms);
+        let mut count = 0;
+        for (_, path) in self.paths.iter_mut() {
+            if path.active || path.is_abandon {
+                continue;
+            }
+            if now.duration_since(path.last_recv_time) > timeout {
+                path.is_abandon = true;
+                path.set_active(false);
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Promote to multipath mode.
     pub fn enable_multipath(&mut self) {
         self.is_multipath = true;
@@ -981,6 +1010,111 @@ mod tests {
         // Fake receiving of PATH_RESPONSE on the first path.
         path_mgr.on_path_resp_received(pid1, data);
         assert_eq!(path_mgr.min_path_chal_timer(), Some(timeout2));
+
+        Ok(())
+    }
+
+    #[test]
+    fn abandon_stale_paths_disabled_when_zero() -> Result<()> {
+        let clients = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9444),
+        ];
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        let mut path_mgr = new_path_mgr(&clients, server_addr, 8, false)?;
+
+        let now = time::Instant::now();
+        let far_future = now + Duration::from_secs(3600);
+        assert_eq!(path_mgr.abandon_stale_paths(far_future, 0), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn abandon_stale_paths_skips_active() -> Result<()> {
+        let clients = vec![SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            9443,
+        )];
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        let mut path_mgr = new_path_mgr(&clients, server_addr, 8, false)?;
+
+        // The initial path is active; it must never be abandoned.
+        let now = time::Instant::now();
+        let far_future = now + Duration::from_secs(3600);
+        assert_eq!(path_mgr.abandon_stale_paths(far_future, 1000), 0);
+        assert!(!path_mgr.get_active()?.is_abandoned());
+
+        Ok(())
+    }
+
+    #[test]
+    fn abandon_stale_paths_marks_inactive_expired() -> Result<()> {
+        let clients = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9444),
+        ];
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        let mut path_mgr = new_path_mgr(&clients, server_addr, 8, false)?;
+
+        let pid = path_mgr
+            .get_path_id(&(clients[1], server_addr))
+            .ok_or(Error::InternalError)?;
+        assert!(!path_mgr.get(pid)?.is_abandoned());
+
+        // Advance well past the timeout.
+        let far_future = time::Instant::now() + Duration::from_secs(60);
+        assert_eq!(path_mgr.abandon_stale_paths(far_future, 1000), 1);
+        assert!(path_mgr.get(pid)?.is_abandoned());
+
+        Ok(())
+    }
+
+    #[test]
+    fn abandon_stale_paths_skips_already_abandoned() -> Result<()> {
+        let clients = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9444),
+        ];
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        let mut path_mgr = new_path_mgr(&clients, server_addr, 8, false)?;
+
+        let far_future = time::Instant::now() + Duration::from_secs(60);
+
+        // First call abandons the stale path.
+        assert_eq!(path_mgr.abandon_stale_paths(far_future, 1000), 1);
+        // Second call finds it already abandoned, returns 0.
+        assert_eq!(path_mgr.abandon_stale_paths(far_future, 1000), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn abandon_stale_paths_respects_recent_recv() -> Result<()> {
+        let clients = vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9443),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9444),
+        ];
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        let mut path_mgr = new_path_mgr(&clients, server_addr, 8, false)?;
+
+        let pid = path_mgr
+            .get_path_id(&(clients[1], server_addr))
+            .ok_or(Error::InternalError)?;
+
+        // Simulate a recent packet by updating last_recv_time.
+        let now = time::Instant::now();
+        path_mgr.get_mut(pid)?.last_recv_time = now;
+
+        // Check just before the timeout expires — should NOT abandon.
+        let before_timeout = now + Duration::from_millis(999);
+        assert_eq!(path_mgr.abandon_stale_paths(before_timeout, 1000), 0);
+        assert!(!path_mgr.get(pid)?.is_abandoned());
+
+        // Check just after the timeout expires — should abandon.
+        let after_timeout = now + Duration::from_millis(1001);
+        assert_eq!(path_mgr.abandon_stale_paths(after_timeout, 1000), 1);
+        assert!(path_mgr.get(pid)?.is_abandoned());
 
         Ok(())
     }
