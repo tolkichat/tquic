@@ -337,6 +337,11 @@ impl Path {
         self.active && self.dcid_seq.is_some()
     }
 
+    /// Returns true if this path has been abandoned (should not be used for scheduling).
+    pub fn is_abandoned(&self) -> bool {
+        self.is_abandon
+    }
+
     /// Set the active state of the path
     pub(crate) fn set_active(&mut self, v: bool) {
         self.active = v;

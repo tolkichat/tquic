@@ -47,7 +47,7 @@ impl MultipathScheduler for MinRttScheduler {
 
         for (pid, path) in paths.iter_mut() {
             // Skip the path that is not ready for sending non-probing packets.
-            if !path.active() || !path.recovery.can_send() {
+            if !path.active() || path.is_abandoned() || !path.recovery.can_send() {
                 continue;
             }
 

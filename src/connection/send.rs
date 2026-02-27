@@ -1544,7 +1544,7 @@ impl Connection {
 
             // Select a validated path with ACK/PTO/Buffered packets to send.
             for (pid, path) in self.paths.iter_mut() {
-                if !path.active() {
+                if !path.active() || path.is_abandon {
                     continue;
                 }
                 match self.spaces.get(path.space_id) {

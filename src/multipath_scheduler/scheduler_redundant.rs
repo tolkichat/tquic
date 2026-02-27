@@ -51,7 +51,7 @@ impl MultipathScheduler for RedundantScheduler {
     ) -> Result<usize> {
         for (pid, path) in paths.iter_mut() {
             // Skip the path that is not ready for sending non-probing packets.
-            if !path.active() || !path.recovery.can_send() {
+            if !path.active() || path.is_abandoned() || !path.recovery.can_send() {
                 continue;
             }
             return Ok(pid);
@@ -75,7 +75,7 @@ impl MultipathScheduler for RedundantScheduler {
 
         // Reinject the frames to other active paths.
         for (pid, path) in paths.iter() {
-            if pid == path_id || !path.active() {
+            if pid == path_id || !path.active() || path.is_abandoned() {
                 continue;
             }
             let space = match spaces.get_mut(path.space_id) {

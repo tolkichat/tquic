@@ -107,7 +107,7 @@ impl MultipathScheduler for BlestScheduler {
 
         // Gather completion times and RTTs for all active paths
         for (pid, path) in paths.iter_mut() {
-            if !path.active() || !path.recovery.can_send() {
+            if !path.active() || path.is_abandoned() || !path.recovery.can_send() {
                 continue;
             }
 
