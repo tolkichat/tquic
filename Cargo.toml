@@ -41,6 +41,9 @@ qlog = ["dep:serde", "dep:serde_json", "dep:serde_derive", "dep:serde_with"]
 # enable support for h3
 h3 = ["dep:sfv"]
 
+# enable multipath path-stats monitoring API (MultipathHandle, PathStatsSnapshot)
+multipath-stats = []
+
 # enable tokio async runtime adapter
 tokio-runtime = ["dep:tokio"]
 

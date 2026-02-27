@@ -26,6 +26,10 @@ mod error;
 #[cfg(not(feature = "tokio-reactor"))]
 mod stream;
 
+#[cfg(all(not(feature = "tokio-reactor"), feature = "multipath-stats"))]
+pub use connection::MultipathHandle;
+#[cfg(all(not(feature = "tokio-reactor"), feature = "multipath-stats"))]
+pub use connection::PathStatsSnapshot;
 #[cfg(not(feature = "tokio-reactor"))]
 pub use connection::TquicConnection;
 #[cfg(not(feature = "tokio-reactor"))]

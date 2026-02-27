@@ -313,4 +313,156 @@ impl TquicConnection {
             notified.await;
         }
     }
+
+    /// Check whether multipath QUIC has been negotiated for this connection.
+    pub fn is_multipath(&self) -> Result<bool, AsyncError> {
+        let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
+        let conn = state
+            .endpoint()
+            .conn_get_mut(self.inner.index)
+            .ok_or(AsyncError::ConnectionClosed)?;
+        Ok(conn.is_multipath())
+    }
+
+    /// Send a PING frame on a specific path (or all active paths if `None`).
+    pub fn ping(&self, path_addr: Option<crate::FourTuple>) -> Result<(), AsyncError> {
+        let waker = {
+            let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
+            let conn = state
+                .endpoint()
+                .conn_get_mut(self.inner.index)
+                .ok_or(AsyncError::ConnectionClosed)?;
+            conn.ping(path_addr).map_err(AsyncError::Tquic)?;
+            extract_driver_waker(&state)
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+        Ok(())
+    }
+
+    /// Collect per-path statistics for all paths on this connection.
+    #[cfg(feature = "multipath-stats")]
+    pub fn path_stats(&self) -> Result<Vec<(crate::FourTuple, PathStatsSnapshot)>, AsyncError> {
+        let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
+        let conn = state
+            .endpoint()
+            .conn_get_mut(self.inner.index)
+            .ok_or(AsyncError::ConnectionClosed)?;
+        let addrs: Vec<crate::FourTuple> = conn.paths_iter().collect();
+        let mut result = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            if let Ok(stats) = conn.get_path_stats(addr.local, addr.remote) {
+                result.push((addr, PathStatsSnapshot::from_path_stats(stats)));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Create a lightweight handle for multipath monitoring.
+    ///
+    /// The handle can be used from a separate task to check path health
+    /// without owning the full connection (no stream channels).
+    #[cfg(feature = "multipath-stats")]
+    pub fn multipath_handle(&self) -> MultipathHandle {
+        MultipathHandle {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+// --- MultipathHandle & PathStatsSnapshot (feature = "multipath-stats") ---
+
+/// Lightweight handle for multipath path monitoring.
+///
+/// Created via [`TquicConnection::multipath_handle`]. Holds only an
+/// `Arc<ConnectionInner>` -- no stream channels -- so it is `Send + Sync`
+/// and can live in a separate monitoring task.
+#[cfg(feature = "multipath-stats")]
+pub struct MultipathHandle {
+    inner: Arc<ConnectionInner>,
+}
+
+#[cfg(feature = "multipath-stats")]
+impl MultipathHandle {
+    /// Check whether multipath QUIC has been negotiated.
+    pub fn is_multipath(&self) -> Result<bool, AsyncError> {
+        let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
+        let conn = state
+            .endpoint()
+            .conn_get_mut(self.inner.index)
+            .ok_or(AsyncError::ConnectionClosed)?;
+        Ok(conn.is_multipath())
+    }
+
+    /// Send a PING frame on a specific path (or all active paths if `None`).
+    pub fn ping(&self, path_addr: Option<crate::FourTuple>) -> Result<(), AsyncError> {
+        let waker = {
+            let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
+            let conn = state
+                .endpoint()
+                .conn_get_mut(self.inner.index)
+                .ok_or(AsyncError::ConnectionClosed)?;
+            conn.ping(path_addr).map_err(AsyncError::Tquic)?;
+            extract_driver_waker(&state)
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+        Ok(())
+    }
+
+    /// Collect per-path statistics for all paths.
+    pub fn path_stats(&self) -> Result<Vec<(crate::FourTuple, PathStatsSnapshot)>, AsyncError> {
+        let mut state = self.inner.endpoint.state.lock().expect("endpoint lock");
+        let conn = state
+            .endpoint()
+            .conn_get_mut(self.inner.index)
+            .ok_or(AsyncError::ConnectionClosed)?;
+        let addrs: Vec<crate::FourTuple> = conn.paths_iter().collect();
+        let mut result = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            if let Ok(stats) = conn.get_path_stats(addr.local, addr.remote) {
+                result.push((addr, PathStatsSnapshot::from_path_stats(stats)));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Check whether the connection has been closed.
+    pub fn is_closed(&self) -> bool {
+        self.inner
+            .conn_state
+            .lock()
+            .expect("conn_state lock")
+            .close_info
+            .is_some()
+    }
+}
+
+/// Lightweight snapshot of per-path statistics.
+#[cfg(feature = "multipath-stats")]
+#[derive(Clone, Copy, Debug)]
+pub struct PathStatsSnapshot {
+    /// Smoothed round-trip time in microseconds.
+    pub srtt: u64,
+    /// Number of packets sent on this path.
+    pub sent_count: u64,
+    /// Number of packets received on this path.
+    pub recv_count: u64,
+    /// Number of packets lost on this path.
+    pub lost_count: u64,
+}
+
+#[cfg(feature = "multipath-stats")]
+impl PathStatsSnapshot {
+    /// Create from a full `PathStats` reference.
+    pub fn from_path_stats(stats: &crate::PathStats) -> Self {
+        Self {
+            srtt: stats.srtt,
+            sent_count: stats.sent_count,
+            recv_count: stats.recv_count,
+            lost_count: stats.lost_count,
+        }
+    }
 }
