@@ -506,7 +506,12 @@ impl PathMap {
             let (pid_to_remove, _) = self
                 .paths
                 .iter()
-                .find(|(_, p)| p.unused() || p.state() == PathState::Failed)
+                .find(|(_, p)| p.is_abandoned())
+                .or_else(|| {
+                    self.paths
+                        .iter()
+                        .find(|(_, p)| p.unused() || p.state() == PathState::Failed)
+                })
                 .ok_or(Error::Done)?;
             let path = self.paths.remove(pid_to_remove);
             self.addrs.remove(&(path.local_addr, path.remote_addr));
